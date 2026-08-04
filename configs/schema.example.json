@@ -1,0 +1,60 @@
+{
+  "schema_version": "genet.raw-pair/v1",
+  "preprocess": {
+    "num_frames": 81,
+    "sample_fps": 16.0,
+    "height": 192,
+    "width": 320,
+    "action_dim": 64,
+    "action_resample": "linear",
+    "short_policy": "drop",
+    "truncate_actions": false,
+    "default_video_fps": 30.0,
+    "default_action_fps": 30.0,
+    "video_layout": "auto",
+    "reference_seed": 2026,
+    "randomize_reference_start": true,
+    "validate_wan_frames": true,
+    "wan_frame_offset": 1,
+    "wan_temporal_stride": 4
+  },
+  "raw_pair_example": {
+    "id": "task-000001",
+    "source": {
+      "episode_id": "franka-episode-0042",
+      "embodiment": "franka_panda",
+      "video": "media/franka-episode-0042.mp4",
+      "actions": "media/franka-episode-0042.actions.npz",
+      "action_key": "actions",
+      "timestamp_key": "timestamps",
+      "start_time": 12.5,
+      "end_time": 20.0,
+      "metadata": {
+        "task": "pick_red_cube"
+      }
+    },
+    "target_gt": {
+      "episode_id": "ur5-episode-0117",
+      "embodiment": "ur5e",
+      "video": "media/ur5-episode-0117.mp4",
+      "actions": "media/ur5-episode-0117.actions.npy",
+      "action_timestamps": "media/ur5-episode-0117.timestamps.npy",
+      "start_time": 5.0,
+      "end_time": 12.5
+    },
+    "reference_target": {
+      "episode_id": "ur5-episode-0302",
+      "embodiment": "ur5e",
+      "video": "media/ur5-episode-0302.mp4",
+      "actions": "media/ur5-episode-0302.actions.pt",
+      "action_key": "actions",
+      "timestamp_key": "timestamps",
+      "start_time": 0.0,
+      "end_time": 18.0
+    },
+    "metadata": {
+      "task_id": "pick_red_cube",
+      "split": "train"
+    }
+  }
+}

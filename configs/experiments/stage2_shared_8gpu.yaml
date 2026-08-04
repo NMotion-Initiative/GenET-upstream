@@ -1,0 +1,22 @@
+_base_: ../base.yaml
+
+model:
+  backend: cosmos3_edge
+  latent_channels: 48
+  reference:
+    enabled: true
+    projection_mode: shared
+    routing: ar_dm
+  parallelism:
+    data_parallel_shard_degree: 8
+    data_parallel_replicate_degree: 1
+    context_parallel_shard_degree: 1
+    cfg_parallel_shard_degree: 1
+
+train:
+  stage: reference
+  grad_accum_steps: 4
+
+checkpoint:
+  output_dir: outputs/stage2_shared_8gpu
+

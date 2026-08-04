@@ -1,0 +1,21 @@
+_base_: ../base.yaml
+
+model:
+  backend: cosmos3_edge
+  # Adapter infers the native 48-channel Wan2.2 latent width from Cosmos.
+  latent_channels: 48
+  reference:
+    enabled: false
+  parallelism:
+    data_parallel_shard_degree: 8
+    data_parallel_replicate_degree: 4
+    context_parallel_shard_degree: 1
+    cfg_parallel_shard_degree: 1
+
+train:
+  stage: control
+  grad_accum_steps: 1
+
+checkpoint:
+  output_dir: outputs/stage1_control_32gpu
+

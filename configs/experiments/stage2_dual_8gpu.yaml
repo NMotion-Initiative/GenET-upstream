@@ -1,0 +1,23 @@
+_base_: ../base.yaml
+
+model:
+  backend: cosmos3_edge
+  latent_channels: 48
+  reference:
+    enabled: true
+    projection_mode: dual
+    routing: ar_dm
+  parallelism:
+    data_parallel_shard_degree: 8
+    data_parallel_replicate_degree: 1
+    context_parallel_shard_degree: 1
+    cfg_parallel_shard_degree: 1
+
+train:
+  stage: reference
+  grad_accum_steps: 4
+
+checkpoint:
+  output_dir: outputs/stage2_dual_8gpu
+  # Fair shared -> dual migration: initialize route B from the loaded route A.
+  copy_shared_reference_to_dual: true

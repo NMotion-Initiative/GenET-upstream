@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genet"
+version = "0.1.0"
+description = "Cross-embodiment synchronized video and action generation on Cosmos3-Edge"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "torch>=2.4",
+]
+
+[project.optional-dependencies]
+preprocess = [
+  "av>=12",
+  "pillow>=10",
+]
+cosmos = [
+  "cosmos-framework @ git+https://github.com/NVIDIA/cosmos-framework.git@a904d2d36b774a51dd06ff9ff906816b1a04f579",
+]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "ruff>=0.12",
+]
+
+[project.scripts]
+genet-preprocess = "genet.cli.preprocess:main"
+genet-train = "genet.cli.train:main"
+genet-validate-data = "genet.cli.validate_data:main"
+genet-checkpoint = "genet.cli.checkpoint:main"
+genet-generate-long = "genet.cli.generate_long:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

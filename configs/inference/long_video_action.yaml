@@ -1,0 +1,31 @@
+# Long synchronized video/action generation. Every key maps directly and
+# strictly to genet.inference.LongHorizonConfig.
+chunk_frames: 81
+overlap_frames: 17
+temporal_compression_factor: 4
+action_alignment: frame
+base_seed: 42
+store_video_dtype: float16
+
+sampling:
+  guidance: 1.5
+  num_steps: 35
+  shift: 5.0
+  sigma_max: 80.0
+  normalize_cfg: false
+  has_negative_prompt: false
+
+recovery:
+  max_attempts_per_chunk: 3
+  rollback_depth: 1
+  rollback_chunks: 1
+  max_total_rollbacks: 8
+  resume: true
+
+continuity:
+  require_finite: true
+  max_video_prefix_mae: 0.20
+  max_action_prefix_relative_mae: 0.0001
+  # Populate these only after embodiment-specific calibration.
+  max_video_boundary_mae: null
+  max_action_boundary_relative_jump: null
