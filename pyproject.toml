@@ -35,6 +35,8 @@ genet-train = "genet.cli.train:main"
 genet-validate-data = "genet.cli.validate_data:main"
 genet-checkpoint = "genet.cli.checkpoint:main"
 genet-generate-long = "genet.cli.generate_long:main"
+genet-cluster-lock = "genet.cli.cluster_lock:main"
+genet-cluster-preflight = "genet.cli.cluster_preflight:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

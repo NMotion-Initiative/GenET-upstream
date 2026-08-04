@@ -19,11 +19,8 @@ import torch.distributed as dist
 
 from genet.config import ProjectConfig
 from genet.training.checkpoint import verify_committed_checkpoint
-from genet.training.distributed import (
-    assert_same_across_ranks,
-    raise_if_any_rank_failed,
-    sha256_file,
-)
+from genet.training.distributed import assert_same_across_ranks, raise_if_any_rank_failed, sha256_file
+from genet.training.environment import assert_artifact_bound_to_receipt, assert_runtime_environment_consistent
 
 
 def _manifest_domains(path: Path, maximum: int) -> dict[str, int]:
@@ -83,6 +80,37 @@ def _checkpoint_load_path(config: ProjectConfig) -> tuple[str, bool]:
     path = Path(external).expanduser().resolve()
     require_dcp(path)
     return str(path), False
+
+
+def _wan_vae_path() -> Path:
+    value = os.environ.get("WAN_VAE_PATH")
+    if not value:
+        raise ValueError("Cosmos training requires WAN_VAE_PATH")
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"WAN_VAE_PATH does not exist: {path}")
+    return path
+
+
+def _validate_hf_cache_revision(cache_root: str | Path, expected_revision: str) -> None:
+    root = Path(cache_root).expanduser().resolve()
+    candidates = (
+        root / "hub" / "models--nvidia--Cosmos3-Edge" / "refs" / "main",
+        root / "models--nvidia--Cosmos3-Edge" / "refs" / "main",
+        root / "refs" / "main",
+    )
+    reference = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if reference is None:
+        raise FileNotFoundError(
+            "offline Cosmos3-Edge cache has no refs/main; prefetch the pinned revision "
+            f"under HF_HOME or HF_HUB_CACHE: {root}"
+        )
+    actual_revision = reference.read_text(encoding="utf-8").strip()
+    if actual_revision != expected_revision:
+        raise ValueError(
+            "Cosmos3-Edge cache revision differs from GENET_HF_SNAPSHOT_REVISION: "
+            f"{actual_revision} != {expected_revision}"
+        )
 
 
 def _disable_online_sampling(callbacks: Any) -> None:
@@ -204,6 +232,7 @@ def _build_cosmos_config(
     *,
     manifest: Path,
     embodiment_map: dict[str, int],
+    checkpoint_load: tuple[str, bool] | None = None,
 ) -> Any:
     try:
         from cosmos_framework.configs.base.config import make_config
@@ -250,12 +279,7 @@ def _build_cosmos_config(
     model_config.rectified_flow_training_config.action_loss_weight = (
         project.train.loss.action
     )
-    wan_vae = os.environ.get("WAN_VAE_PATH")
-    if not wan_vae:
-        raise ValueError("Cosmos training requires WAN_VAE_PATH")
-    wan_vae_path = Path(wan_vae).expanduser().resolve()
-    if not wan_vae_path.is_file():
-        raise FileNotFoundError(f"WAN_VAE_PATH does not exist: {wan_vae_path}")
+    wan_vae_path = _wan_vae_path()
     model_config.tokenizer.vae_path = str(wan_vae_path)
 
     cross_config = dataclasses.asdict(project.model)
@@ -360,7 +384,7 @@ def _build_cosmos_config(
         resolved.trainer.callbacks.grad_clip.clip_norm = project.train.grad_clip
     _disable_online_sampling(resolved.trainer.callbacks)
 
-    checkpoint_path, exact_resume = _checkpoint_load_path(project)
+    checkpoint_path, exact_resume = checkpoint_load or _checkpoint_load_path(project)
     resolved.checkpoint.load_path = checkpoint_path
     resolved.checkpoint.load_training_state = exact_resume
     resolved.checkpoint.strict_resume = exact_resume
@@ -396,6 +420,7 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
     # identical to official recipes. Its launch() sees the initialized group and
     # safely treats its own init call as a no-op.
     cosmos_distributed.init()
+    environment_signature = assert_runtime_environment_consistent()
     manifest = Path(project.data.manifest).expanduser().resolve()
     assert_same_across_ranks(
         "distributed_config_fingerprint", project.distributed_fingerprint()
@@ -414,6 +439,55 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
     assert manifest_hash is not None and domains is not None
     assert_same_across_ranks("manifest_sha256", manifest_hash)
     assert_same_across_ranks("embodiment_map", domains)
+    assert_artifact_bound_to_receipt(
+        os.environ.get("GENET_DATA_ARTIFACT", "processed_data"),
+        manifest,
+        allow_descendant=True,
+    )
+
+    wan_vae_path: Path | None = None
+    checkpoint_load: tuple[str, bool] | None = None
+    artifact_error: str | None = None
+    try:
+        wan_vae_path = _wan_vae_path()
+        checkpoint_load = _checkpoint_load_path(project)
+    except Exception as exc:
+        artifact_error = f"{type(exc).__name__}: {exc}"
+    raise_if_any_rank_failed("Cosmos model artifact preflight", artifact_error)
+    assert wan_vae_path is not None and checkpoint_load is not None
+    assert_artifact_bound_to_receipt(
+        os.environ.get("GENET_WAN_VAE_ARTIFACT", "wan_vae"),
+        wan_vae_path,
+    )
+    assert_artifact_bound_to_receipt(
+        os.environ.get("GENET_CHECKPOINT_ARTIFACT", "training_checkpoint"),
+        checkpoint_load[0],
+    )
+    hf_cache = os.environ.get("HF_HUB_CACHE") or os.environ.get("HF_HOME")
+    hf_error = None
+    strict_environment = os.environ.get("GENET_STRICT_ENV", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if strict_environment:
+        if not hf_cache:
+            hf_error = "strict Cosmos training requires HF_HOME or HF_HUB_CACHE"
+        else:
+            try:
+                _validate_hf_cache_revision(
+                    hf_cache,
+                    os.environ["GENET_HF_SNAPSHOT_REVISION"],
+                )
+            except Exception as exc:
+                hf_error = f"{type(exc).__name__}: {exc}"
+    raise_if_any_rank_failed("Hugging Face cache preflight", hf_error)
+    if hf_cache:
+        assert_artifact_bound_to_receipt(
+            os.environ.get("GENET_HF_ARTIFACT", "hf_cache"),
+            hf_cache,
+        )
     _validate_local_cosmos_copy(project, manifest=manifest)
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -439,6 +513,7 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
             project,
             manifest=manifest,
             embodiment_map=domains,
+            checkpoint_load=checkpoint_load,
         )
     except Exception as exc:
         config_error = f"{type(exc).__name__}: {exc}"
@@ -455,6 +530,7 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
                         "probed_sample": probe_id,
                         "embodiment_map": domains,
                         "output": str(Path(project.checkpoint.output_dir).resolve()),
+                        "runtime_environment": environment_signature,
                         "world_size": world_size,
                     },
                     indent=2,

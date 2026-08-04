@@ -73,10 +73,15 @@ hf auth login
 将模型和 VAE 下载到每个节点的本地 checkpoint 盘，或先下载一次再复制到四个节点：
 
 ```bash
+export COSMOS3_EDGE_HF_REVISION=REPLACE_WITH_MODEL_REPOSITORY_COMMIT
+export WAN22_HF_REVISION=REPLACE_WITH_MODEL_REPOSITORY_COMMIT
+
 hf download nvidia/Cosmos3-Edge \
+  --revision "${COSMOS3_EDGE_HF_REVISION}" \
   --local-dir checkpoints/Cosmos3-Edge-hf
 
 hf download Wan-AI/Wan2.2-TI2V-5B Wan2.2_VAE.pth \
+  --revision "${WAN22_HF_REVISION}" \
   --local-dir checkpoints/wan22_vae
 ```
 
@@ -107,6 +112,63 @@ export WAN_VAE_PATH=/local_nvme/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth
 生产 builder 会用该变量覆盖上游 tokenizer 的 `vae_path`。基础 DCP 可以通过命令行 `--warm-start` 传入；如果未传，builder 会读取 `BASE_CHECKPOINT_PATH`。
 
 processed manifest 的 caption 会在 production Dataset 中通过 Edge 官方 `model.config.vlm_config.tokenizer` 转成 `text_token_ids`。因此每个节点还必须能从本地 Hugging Face cache 解析 `nvidia/Cosmos3-Edge` processor；离线集群应在提交前预热并复制同一 `HF_HOME` cache，不能等 worker 启动后访问公网。
+
+### 2.4 无共享存储的环境与内容锁
+
+四个节点不能各自执行不带 lock 的 `pip install` 并假定环境相同。生产作业应从
+[`containers/Dockerfile`](../containers/Dockerfile) 构建一次镜像，固定 base image digest、GenET commit 与
+Cosmos commit，再让四个节点拉取同一个 OCI digest；Apptainer 集群则只转换一次并复制同一个 SIF。必须按
+README 使用 `git archive HEAD` 加入 `GENET_BUILD_REVISION`，不能用 dirty worktree 直接构建并贴上 HEAD 标签。
+
+在 staging 副本上为数据、VAE、DCP、normalization 和固定 HF snapshot 建立内容锁：
+
+```bash
+genet-cluster-lock create \
+  --output /staging/genet-release/cluster-lock.json \
+  --artifact processed_data=/staging/genet/data/processed/train \
+  --artifact wan_vae=/staging/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth \
+  --artifact training_checkpoint=/staging/genet/checkpoints/stage2_shared_committed \
+  --artifact normalization=/staging/genet/data/normalization \
+  --artifact hf_cache=/staging/genet/hf-cache
+```
+
+复制到每个节点的本地 NVMe 后，在 scheduler prologue 中用相同逻辑名称验证本地路径：
+
+```bash
+genet-cluster-lock verify \
+  --lock /local_nvme/genet/release/cluster-lock.json \
+  --receipt /local_nvme/genet/release/node-receipt.json \
+  --artifact processed_data=/local_nvme/genet/data/processed/train \
+  --artifact wan_vae=/local_nvme/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth \
+  --artifact training_checkpoint=/local_nvme/genet/checkpoints/stage2_shared_committed \
+  --artifact normalization=/local_nvme/genet/data/normalization \
+  --artifact hf_cache=/local_nvme/genet/hf-cache
+```
+
+`training_checkpoint` 必须是本作业实际通过 `--warm-start`、`--resume` 或 `BASE_CHECKPOINT_PATH` 加载的 DCP；
+S1、S2/S3 和 resume 作业应分别替换成各自真实路径。临时 dataschema 还没有 normalization 文件时，
+create/verify 两边同时删掉该逻辑项。lock 会扫描目录中的每个
+regular file；HF cache 使用的内部 symlink 会按 root-relative target 记录，broken link 或逃逸 artifact root 的
+link 会被拒绝。这一步可能较慢，但只在 staging/deployment 阶段执行，不在每个训练 step 执行。
+receipt 会把逻辑 artifact 绑定到本节点实际验证过的路径；训练启动会拒绝使用 receipt 之外的 manifest、VAE、
+HF cache 或 load DCP。verified release 在作业期间必须只读。任一节点失败时 scheduler 必须终止整个作业，
+不能让该节点继续加入 `torchrun`。
+
+提交作业时启用 `GENET_STRICT_ENV=1`，并设置镜像 digest、GenET/Cosmos revision、cluster lock 和固定 HF
+revision，示例见 [`configs/cluster/roce_4x8.env.example`](../configs/cluster/roce_4x8.env.example)。训练入口还会
+跨 rank 自动比较 Python/Torch/CUDA/cuDNN/NCCL、GPU 型号、package-set hash、installed GenET Python-source
+hash、embedded build revision、可发现的 Git revision、cluster-lock hash 与 path-independent receipt contract。
+内容锁负责“大文件实际字节”，receipt 负责运行路径绑定，collective 负责“rank 环境漂移”；三者不能互相替代。
+
+正式 32-rank NCCL 作业前，四个节点先各启动一个 CPU/Gloo preflight 进程：
+
+```bash
+bash scripts/preflight_roce.sh
+```
+
+它使用带 timeout 的独立 `PREFLIGHT_PORT` 比较四个节点的严格运行时 identity，拒绝重复物理 node identity，
+并检查每节点可见 GPU 数量、型号、compute capability、显存与 NVIDIA driver。通过后仍需按第 9 节运行
+nccl-tests；CPU/Gloo preflight 只能提前发现环境漂移，不能替代 RoCE/NCCL 性能与连通性验收。
 
 ## 3. 数据训练前检查
 
@@ -364,7 +426,6 @@ torchrun --standalone --nproc-per-node=8 \
 ```bash
 source configs/cluster/roce_4x8.env.example
 export NODE_RANK=0                 # 其他节点依次为 1/2/3
-export RDZV_ID="${SLURM_JOB_ID:-genet-stage3-shared-seed42}"
 ```
 
 然后四个节点近似同时运行相同配置：
@@ -409,15 +470,23 @@ DCP、resolved config 和训练日志都应从这个目录下查找。standalone
 
 ```text
 torchrun --nnodes=4 --nproc-per-node=8 --node-rank=<0..3>
-         --rdzv-backend=c10d
-         --rdzv-endpoint=<MASTER_ADDR>:<MASTER_PORT>
-         --rdzv-id=<RDZV_ID>
+         --master-addr=<MASTER_ADDR>
+         --master-port=<MASTER_PORT>
+         --max-restarts=0
          -m genet.cli.train --config <CONFIG>
 ```
 
-所有节点必须使用完全相同的 `NNODES`、`NPROC_PER_NODE`、`MASTER_ADDR`、`MASTER_PORT`、`RDZV_ID` 和配置内容。`MASTER_ADDR` 是 rank-0 节点所有节点均可访问的 bootstrap 地址，不一定是 RDMA HCA 地址。
+这里故意使用 static rendezvous，使 scheduler 给出的 `NODE_RANK=0..3` 真正决定 global-rank block，并与无共享
+checkpoint 的 node publish ID 保持一致。c10d elastic rendezvous 会按 join order 分配 group rank，不能把它与
+手工 `NODE_RANK` 混用。所有节点必须使用完全相同的 `NNODES`、`NPROC_PER_NODE`、`MASTER_ADDR`、
+`MASTER_PORT` 和配置内容；只有 `NODE_RANK` 不同。`MASTER_ADDR` 是 rank-0 节点所有节点均可访问的 bootstrap
+地址，不一定是 RDMA HCA 地址；并发作业必须使用不同 `MASTER_PORT`。
 
-第一次提交某个配置时，先在四节点命令末尾增加 `--dry-run`。production dry-run 会初始化 process group、解析固定 upstream recipe、确认 DCP 目录含 `.metadata`、确认 `WAN_VAE_PATH` 存在、比较 manifest/语义配置/embodiment map，并由每个节点的 8 个 local rank 并行分片完成一次等价于 `genet-validate-data --cosmos` 的全量校验；随后每个 rank 再读取、转换自己的首个 global-rank shard 样本。它不会构造昂贵模型或进入 optimizer step。通过后再去掉该参数。
+第一次提交某个配置时，先在四节点命令末尾增加 `--dry-run`。production dry-run 会初始化 process group、
+比较运行时环境 contract，解析固定 upstream recipe、确认 DCP 目录含 `.metadata`、确认 `WAN_VAE_PATH` 存在、
+比较 manifest/语义配置/embodiment map，并由每个节点的 8 个 local rank 并行分片完成一次等价于
+`genet-validate-data --cosmos` 的全量校验；随后每个 rank 再读取、转换自己的首个 global-rank shard 样本。
+它不会构造昂贵模型或进入 optimizer step。通过后再去掉该参数。
 
 ## 9. RoCE/NCCL 环境与诊断
 
@@ -527,7 +596,12 @@ rank, rank + WORLD_SIZE, rank + 2 × WORLD_SIZE, ...
 - reference 由稳定 hash 选择，不依赖 worker-local RNG。实现位于 [`src/genet/data/reference.py`](../src/genet/data/reference.py)；当前训练入口固定 reference 不随 epoch 改变（底层 Dataset API 可显式启用 epoch salt）；
 - 精确 resume 时，上游传入 `optimizer_iteration × grad_accum`；resume-aware packing loader 将其 `divmod(local_epoch_length)` 还原为 epoch 与 offset，并丢弃 prewarm buffer，因此不会从本地 index 0 静默重放。
 
-standalone 与 production 训练入口都会在第一次前向前调用 [`assert_same_across_ranks`](../src/genet/training/distributed.py)，自动比对排除节点本地路径后的语义 config fingerprint、manifest SHA256 和排序后的 embodiment map。因此各节点 processed/checkpoint 根路径可以不同，实验参数不能不同。VAE、基础 DCP、normalization、容器与 git revision 的内容 fingerprint 尚未由入口自动 all-gather，仍属于提交脚本必须执行的运维检查。
+standalone 与 production 训练入口都会在第一次前向前自动比对排除节点本地路径后的语义 config
+fingerprint、manifest SHA256、排序后的 embodiment map，以及 Python/Torch/CUDA/cuDNN/NCCL、GPU、
+package-set、installed GenET Python-source、embedded build revision、Git revision 声明、镜像 digest 声明、
+cluster-lock hash 与 path-independent receipt contract。因此各节点 processed/checkpoint 根路径可以不同，
+实验参数和内容 identity 不能不同。大文件本身不会在 32 个 rank 中重复扫描；它们必须先由每节点一次的
+`genet-cluster-lock verify --receipt ...` 验证，训练再把实际 runtime paths 与 receipt 绑定。
 
 ## 11. HSDP/FSDP 拓扑
 
@@ -786,7 +860,10 @@ genet-generate-long \
 提交前：
 
 - [ ] 四节点 GenET/Cosmos commit、容器、依赖版本一致；
-- [ ] 四节点 manifest、stats、normalization、VAE、base DCP fingerprint 一致；
+- [ ] immutable image digest、HF snapshot revision 与 `GENET_STRICT_ENV=1` 已设置；
+- [ ] `genet-cluster-lock verify --receipt ...` 已在四节点通过，manifest、NPZ、stats、normalization、VAE、
+      实际 load DCP 与 HF cache 一致且绑定到运行路径；
+- [ ] 单进程/节点 `scripts/preflight_roce.sh` 已通过；
 - [ ] 数据已通过 `genet-validate-data`，无训练期 skip；
 - [ ] `T=1+4N`，Source/Target/Reference shape 与配置一致；
 - [ ] effective global batch 已按 DP degree 计算；
@@ -795,7 +872,7 @@ genet-generate-long \
 - [ ] NCCL 日志确认 RDMA 而非意外 Socket fallback；
 - [ ] checkpoint archive 可达，node leader 发布与 consolidate 流程已演练；
 - [ ] resume 使用完整 committed DCP；stage/topology 改变使用 warm-start；
-- [ ] output、日志和 rendezvous ID 不与其他作业冲突。
+- [ ] output、日志和 static rendezvous `MASTER_PORT` 不与其他作业冲突。
 - [ ] 长时推理另起作业；factory、normalization 和 Source/Reference fingerprint 已冻结；
 - [ ] 已通过真实两窗口 clean-prefix smoke test，视频/action overlap、timestamp、质量门和 journal 恢复一致。
 

@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+build
+dist
+data
+outputs
+checkpoints
+third_party
+wandb
+*.log
+.DS_Store

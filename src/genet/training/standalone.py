@@ -11,8 +11,9 @@ from __future__ import annotations
 import contextlib
 import json
 import math
-from pathlib import Path
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -23,18 +24,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from genet.config import ProjectConfig
 from genet.data import ProcessedPairDataset, collate_pairs
-from genet.models.flow import (
-    interpolate_rectified_flow,
-    masked_token_mean,
-    sample_logit_normal_sigma,
-)
+from genet.models.flow import interpolate_rectified_flow, masked_token_mean, sample_logit_normal_sigma
 from genet.models.generator import CrossEmbodimentGenerator
-from genet.training.checkpoint import (
-    CheckpointManager,
-    TrainerState,
-    capture_rng_state,
-    verify_committed_checkpoint,
-)
+from genet.training.checkpoint import CheckpointManager, TrainerState, capture_rng_state, verify_committed_checkpoint
 from genet.training.distributed import (
     DistributedContext,
     assert_same_across_ranks,
@@ -42,11 +34,8 @@ from genet.training.distributed import (
     seed_everything,
     sha256_file,
 )
-from genet.training.stages import (
-    build_optimizer,
-    build_warmup_cosine_scheduler,
-    configure_trainable_stage,
-)
+from genet.training.environment import assert_artifact_bound_to_receipt, assert_runtime_environment_consistent
+from genet.training.stages import build_optimizer, build_warmup_cosine_scheduler, configure_trainable_stage
 
 
 def _dtype(name: str, device: torch.device) -> torch.dtype:
@@ -256,9 +245,15 @@ def run_standalone_training(
     """Run the dependency-light synchronized RF trainer."""
 
     seed_everything(config.train.seed, context.rank)
+    assert_runtime_environment_consistent()
     manifest = Path(config.data.manifest).expanduser().resolve()
     if not manifest.is_file():
         raise FileNotFoundError(f"processed manifest does not exist: {manifest}")
+    assert_artifact_bound_to_receipt(
+        os.environ.get("GENET_DATA_ARTIFACT", "processed_data"),
+        manifest,
+        allow_descendant=True,
+    )
     assert_same_across_ranks("manifest_sha256", sha256_file(manifest))
     assert_same_across_ranks(
         "distributed_config_fingerprint", config.distributed_fingerprint()
