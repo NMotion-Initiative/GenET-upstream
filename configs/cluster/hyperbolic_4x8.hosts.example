@@ -1,0 +1,7 @@
+# Hostfile order is authoritative: line 1 is NODE_RANK=0, line 4 is rank 3.
+# Use the literal "local" for rank 0 when launching from that node. Configure
+# users, keys, ports, and jump hosts in ~/.ssh/config; keep credentials out of Git.
+local
+REPLACE_WITH_RANK1_SSH_ALIAS
+REPLACE_WITH_RANK2_SSH_ALIAS
+REPLACE_WITH_RANK3_SSH_ALIAS

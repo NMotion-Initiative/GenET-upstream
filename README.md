@@ -38,6 +38,7 @@ Detailed documentation:
 - [Architecture](docs/ARCHITECTURE.md)
 - [Preprocessing and validation](docs/PREPROCESSING.md)
 - [Training, RoCE deployment, and checkpoints](docs/TRAINING.md)
+- [Hyperbolic 4×8-GPU end-to-end runbook](docs/HYPERBOLIC.md)
 - [Long-horizon inference](docs/INFERENCE.md)
 
 ## Quick Start
@@ -82,6 +83,40 @@ python -m genet.cli.train \
 `configs/base.yaml` uses the `toy` backend so the data, gradient, mask, joint-flow, and checkpoint contracts can be tested
 on CPU or one GPU. It is an executable preflight baseline, not a replacement for Cosmos.
 
+## Hyperbolic Cluster Fast Path
+
+For four eight-GPU Hyperbolic nodes without shared storage, use the complete
+[Hyperbolic runbook](docs/HYPERBOLIC.md). It treats `/mnt/nvme/mds-cache/robotwin_v1` as the node-local data cache and
+`/mnt/nvme/genet` as node-local run storage. It covers the full path from immutable image build and canonical
+preprocessing through artifact locks, hostfile-driven remote launch, S1/S2/S3 checkpoint transport, and rollback-safe
+long video–action inference. Hostnames, SSH ports, bootstrap addresses, network interfaces, HCAs, registry references,
+and model revisions remain explicit parameters; the guide does not guess them from provider defaults.
+
+Host Miniconda and a host CUDA toolkit are not required. Install/verify the NVIDIA driver, Docker, NVIDIA Container
+Toolkit, SSH/rsync, and RDMA devices; Python, CUDA user-space libraries, Cosmos, and GenET are supplied by one immutable
+image. After copying and filling the environment/host templates and creating the release lock/receipts, launch all four
+nodes from rank 0 with one attached command:
+
+```bash
+export GENET_IMAGE_REF='registry.example/genet@sha256:<image-digest>'
+
+bash scripts/launch_cluster_ssh.sh \
+  --hosts /secure/path/genet-hosts.txt \
+  --env /secure/path/s1.env \
+  --image "${GENET_IMAGE_REF}" \
+  --config configs/experiments/stage1_control_32gpu.yaml \
+  --run-id s1-control-seed42 \
+  -- \
+  --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl \
+  --warm-start /mnt/nvme/genet/checkpoints/Cosmos3-Edge \
+  --output-dir /mnt/nvme/genet/outputs/s1-control-seed42
+```
+
+The launcher runs host checks, resolves the immutable image concurrently on all nodes, runs a four-node Gloo preflight,
+and runs a 32-rank NCCL/Cosmos dry run before training. Keep this attached coordinator command inside `tmux` or a
+supervised service. See the runbook for image construction under `/dev/shm`, model/data staging, Docker storage
+placement, RoCE discovery, inference, and failure recovery.
+
 ## Cosmos3-Edge Production Environment
 
 The project pins Cosmos Framework to:
@@ -110,6 +145,7 @@ git archive --format=tar \
   HEAD | docker build -f containers/Dockerfile \
   --build-arg BASE_IMAGE='registry.example/cosmos-train@sha256:<base-image-digest>' \
   --build-arg GENET_CODE_REVISION="${GENET_REVISION}" \
+  --build-arg COSMOS_DEPENDENCY_GROUP=cu130-train \
   -t registry.example/genet:${GENET_REVISION} -
 
 docker push registry.example/genet:${GENET_REVISION}
