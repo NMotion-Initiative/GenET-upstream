@@ -73,10 +73,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && uv pip freeze --python .venv/bin/python \
         | LC_ALL=C sort > /tmp/genet-training-before.txt \
     && cp -al .venv "${ROBOTWIN_VENV}" \
-    && uv pip install \
-        --python "${ROBOTWIN_VENV}/bin/python" \
-        'mosaicml-streaming==0.13.0' \
-        'numpy>=1.21.5,<2.2.0' \
+    # Run outside ${COSMOS_DIR}: the Cosmos pyproject declares a global
+    # [tool.uv] override-dependencies numpy pin that uv discovers from the
+    # working directory and that would silently defeat Streaming's <2.2 bound.
+    && ( cd / \
+        && uv pip install \
+            --python "${ROBOTWIN_VENV}/bin/python" \
+            'mosaicml-streaming==0.13.0' \
+            'numpy>=1.21.5,<2.2.0' ) \
     && { uv pip check --python "${ROBOTWIN_VENV}/bin/python" \
         > /tmp/genet-preprocess-check.txt 2>&1 || true; } \
     && cat /tmp/genet-preprocess-check.txt \
