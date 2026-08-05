@@ -641,14 +641,47 @@ def _framework_guard(spec: ArtifactSpec) -> None:
         )
 
 
-# The pinned converter expects the loaded model dict to already carry the
-# training-only `ema` and `activation_checkpointing` sections, but
-# safetensors-layout snapshots such as Cosmos3-Edge do not serialize them and
-# Cosmos3OmniModel.__init__ then fails on the missing keys. Pre-seed both with
-# exactly the disabled values that __init__ assigns, mirroring the upstream
-# action-server override, so the pinned Cosmos source stays untouched.
+# Two gaps in the pinned converter surface on safetensors-layout snapshots
+# such as Cosmos3-Edge when they are converted from an exact local path:
+#
+# 1. A bare --checkpoint-path drops the registered recipe, so the loaded model
+#    dict is only the serialized public config without an instantiation target.
+#    Resolve the recipe's model config file from the upstream checkpoint
+#    registry (named through GENET_COSMOS_CHECKPOINT_NAME) and forward it as
+#    --config-file while the weights still come from the exact local snapshot.
+# 2. The loaded model dict may lack the training-only `ema` and
+#    `activation_checkpointing` sections that Cosmos3OmniModel.__init__
+#    mutates. Pre-seed both with exactly the disabled values that __init__
+#    assigns, mirroring the upstream action-server override.
+#
+# Both adjustments live in this wrapper; the pinned Cosmos source stays
+# untouched.
 _CONVERTER_SHIM = """\
+import os
+import sys
+
 import cosmos_framework.scripts.convert_model_to_dcp as _converter
+
+_checkpoint_name = os.environ.get("GENET_COSMOS_CHECKPOINT_NAME")
+if _checkpoint_name and "--config-file" not in sys.argv:
+    _entry = _converter.OmniSetupOverrides.CHECKPOINTS.get(_checkpoint_name)
+    if _entry is None:
+        raise SystemExit(
+            f"unknown registered Cosmos checkpoint: {_checkpoint_name!r}"
+        )
+    sys.argv += ["--config-file", str(_entry.config_file)]
+    # The instantiated model resolves its own registered checkpoint through
+    # the offline catalog, whose refs/main alias is deliberately published
+    # only after a successful conversion. Pre-seed the registry entries for
+    # this repository with the exact local snapshot instead, mirroring the
+    # converter's own _redirect_avae_to_local.
+    if "--checkpoint-path" in sys.argv:
+        _snapshot = sys.argv[sys.argv.index("--checkpoint-path") + 1]
+        _converter.register_checkpoints()
+        for _registered in _converter._CHECKPOINTS.values():
+            _hf = getattr(_registered, "hf", None)
+            if _hf is not None and _hf.repository == _entry.hf.repository:
+                _hf._path = _snapshot
 
 _build_public_model_config = _converter.build_public_model_config
 
@@ -703,6 +736,9 @@ def _convert_dcp(
                 "HF_HUB_CACHE": str(paths.hub_cache),
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
+                "GENET_COSMOS_CHECKPOINT_NAME": spec.cosmos_repo_id.rsplit(
+                    "/", 1
+                )[-1],
             }
         )
         subprocess.run(
