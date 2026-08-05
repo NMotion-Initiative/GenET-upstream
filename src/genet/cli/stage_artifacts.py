@@ -641,6 +641,30 @@ def _framework_guard(spec: ArtifactSpec) -> None:
         )
 
 
+# The pinned converter expects the loaded model dict to already carry the
+# training-only `ema` and `activation_checkpointing` sections, but
+# safetensors-layout snapshots such as Cosmos3-Edge do not serialize them and
+# Cosmos3OmniModel.__init__ then fails on the missing keys. Pre-seed both with
+# exactly the disabled values that __init__ assigns, mirroring the upstream
+# action-server override, so the pinned Cosmos source stays untouched.
+_CONVERTER_SHIM = """\
+import cosmos_framework.scripts.convert_model_to_dcp as _converter
+
+_build_public_model_config = _converter.build_public_model_config
+
+
+def _build_with_training_defaults(model_dict):
+    config = model_dict.setdefault("config", {})
+    config.setdefault("ema", {}).setdefault("enabled", False)
+    config.setdefault("activation_checkpointing", {}).setdefault("mode", "none")
+    return _build_public_model_config(model_dict)
+
+
+_converter.build_public_model_config = _build_with_training_defaults
+_converter.main()
+"""
+
+
 def _convert_dcp(
     spec: ArtifactSpec,
     paths: StagePaths,
@@ -684,8 +708,8 @@ def _convert_dcp(
         subprocess.run(
             [
                 sys.executable,
-                "-m",
-                "cosmos_framework.scripts.convert_model_to_dcp",
+                "-c",
+                _CONVERTER_SHIM,
                 "-o",
                 str(temporary),
                 "--checkpoint-path",
