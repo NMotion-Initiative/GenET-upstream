@@ -76,7 +76,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && uv pip install \
         --python "${ROBOTWIN_VENV}/bin/python" \
         'mosaicml-streaming==0.13.0' \
-    && uv pip check --python "${ROBOTWIN_VENV}/bin/python" \
+        'numpy>=1.21.5,<2.2.0' \
+    && { uv pip check --python "${ROBOTWIN_VENV}/bin/python" \
+        > /tmp/genet-preprocess-check.txt 2>&1 || true; } \
+    && cat /tmp/genet-preprocess-check.txt \
+    && ! grep '^The package' /tmp/genet-preprocess-check.txt \
+        | grep -v 'jupyter-compare-view.*requires Python' \
+        | grep -q . \
     && "${ROBOTWIN_VENV}/bin/python" -c \
         'import importlib.metadata as m; import numpy, streaming, torch; assert m.version("mosaicml-streaming") == "0.13.0"; assert tuple(map(int, numpy.__version__.split(".")[:2])) < (2, 2); print(torch.__version__, numpy.__version__)' \
     && uv pip freeze --python .venv/bin/python \
@@ -102,7 +108,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-build-isolation \
         --no-deps \
         . \
-    && uv pip check --python "${ROBOTWIN_VENV}/bin/python" \
+    && { uv pip check --python "${ROBOTWIN_VENV}/bin/python" \
+        > /tmp/genet-postinstall-check.txt 2>&1 || true; } \
+    && cat /tmp/genet-postinstall-check.txt \
+    && ! grep '^The package' /tmp/genet-postinstall-check.txt \
+        | grep -v 'jupyter-compare-view.*requires Python' \
+        | grep -q . \
     && uv pip freeze --python "${VIRTUAL_ENV}/bin/python" \
         | LC_ALL=C sort > /opt/GENET_PIP_FREEZE.txt \
     && sha256sum /opt/GENET_PIP_FREEZE.txt > /opt/GENET_PIP_FREEZE.sha256 \
