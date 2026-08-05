@@ -9,9 +9,10 @@ and unit tests usable on lightweight machines.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 from torch.utils.data import Dataset
@@ -495,6 +496,8 @@ class CosmosProcessedPairDataset(Dataset[dict[str, Any]]):
         fps: float,
         reference_mode: str = "stored",
         reference_seed: int = 0,
+        require_bidirectional_pairs: bool = False,
+        expected_embodiments: Sequence[str] | None = None,
         action_alignment: str = "frame",
         tokenizer_config: Any | None = None,
         max_caption_tokens: int = 2048,
@@ -536,10 +539,13 @@ class CosmosProcessedPairDataset(Dataset[dict[str, Any]]):
             sample_format="generic",
             reference_mode=reference_mode,
             reference_seed=reference_seed,
+            require_bidirectional_pairs=require_bidirectional_pairs,
+            expected_embodiments=expected_embodiments,
             normalize_video="none",
             shard_by_rank=False,
         )
         self.global_length = len(self._dataset)
+        self.direction_summary = self._dataset.direction_summary
         self.shard_world_size = 1
         self.shard_rank = 0
         self.shard_id = 0

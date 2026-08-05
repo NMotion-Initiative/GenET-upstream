@@ -33,6 +33,11 @@ def test_pair_schema_resolves_paths_and_rejects_same_reference_episode(tmp_path:
     with pytest.raises(SchemaError, match="must not use"):
         PairRecord.from_dict(raw, base_dir=tmp_path, context="test")
 
+    raw.pop("reference_target")
+    raw["source"] = _episode(tmp_path, "s", "target")
+    with pytest.raises(SchemaError, match="distinct source and target_gt"):
+        PairRecord.from_dict(raw, base_dir=tmp_path, context="test")
+
 
 def test_stateless_reference_is_order_independent_and_excludes_target(tmp_path: Path):
     candidates = [

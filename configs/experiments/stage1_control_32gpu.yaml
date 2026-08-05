@@ -1,5 +1,14 @@
 _base_: ../base.yaml
 
+data:
+  expected_embodiments:
+    - ARX-X5
+    - aloha-agilex
+    - franka-panda
+    - piper
+    - ur5-wsg
+  require_bidirectional_pairs: true
+
 model:
   backend: cosmos3_edge
   # Adapter infers the native 48-channel Wan2.2 latent width from Cosmos.
@@ -18,4 +27,3 @@ train:
 
 checkpoint:
   output_dir: outputs/stage1_control_32gpu
-

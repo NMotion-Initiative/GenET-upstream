@@ -4,11 +4,29 @@ import pytest
 
 from genet.config import load_config
 
+EXPECTED_ROBOTWIN_EMBODIMENTS = [
+    "ARX-X5",
+    "aloha-agilex",
+    "franka-panda",
+    "piper",
+    "ur5-wsg",
+]
+
+PRODUCTION_EXPERIMENTS = [
+    "stage1_control_32gpu.yaml",
+    "stage2_no_ref_8gpu.yaml",
+    "stage2_shared_8gpu.yaml",
+    "stage2_dual_8gpu.yaml",
+    "stage3_shared_32gpu.yaml",
+    "stage3_dual_32gpu.yaml",
+]
+
 
 def test_config_inheritance_and_fingerprint() -> None:
     config = load_config(Path("configs/experiments/stage2_dual_8gpu.yaml"))
     assert config.model.reference.projection_mode == "dual"
     assert config.model.parallelism.data_parallel_replicate_degree == 1
+    assert config.data.require_bidirectional_pairs is True
     assert len(config.fingerprint()) == 64
     local_path_variant = load_config(Path("configs/experiments/stage2_dual_8gpu.yaml"))
     local_path_variant.data.manifest = "/another-node/data/manifest.jsonl"
@@ -17,6 +35,49 @@ def test_config_inheritance_and_fingerprint() -> None:
     assert local_path_variant.distributed_fingerprint() == config.distributed_fingerprint()
     local_path_variant.checkpoint.resume = "/node-local/resume"
     assert local_path_variant.distributed_fingerprint() != config.distributed_fingerprint()
+
+
+@pytest.mark.parametrize("experiment", PRODUCTION_EXPERIMENTS)
+def test_production_experiments_pin_bidirectional_robotwin_contract(
+    experiment: str,
+) -> None:
+    config = load_config(Path("configs/experiments") / experiment)
+    assert config.data.require_bidirectional_pairs is True
+    assert config.data.reference_mode == "stored"
+    assert config.data.expected_embodiments == EXPECTED_ROBOTWIN_EMBODIMENTS
+
+
+@pytest.mark.parametrize(
+    ("yaml", "message"),
+    [
+        (
+            "data:\n  expected_embodiments: [franka-panda, franka-panda]\n",
+            "must not contain duplicates",
+        ),
+        (
+            "data:\n  expected_embodiments: [franka-panda, '']\n",
+            "only non-empty strings",
+        ),
+        (
+            "data:\n  require_bidirectional_pairs: true\n",
+            "requires non-empty data.expected_embodiments",
+        ),
+        (
+            "data:\n"
+            "  expected_embodiments: [franka-panda, ur5-wsg]\n"
+            "  require_bidirectional_pairs: true\n"
+            "  reference_mode: deterministic\n",
+            "requires data.reference_mode='stored'",
+        ),
+    ],
+)
+def test_invalid_bidirectional_data_contract_is_rejected(
+    tmp_path: Path, yaml: str, message: str
+) -> None:
+    path = tmp_path / "bad-bidirectional.yaml"
+    path.write_text(yaml, encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_config(path)
 
 
 def test_wan_frame_invariant(tmp_path: Path) -> None:

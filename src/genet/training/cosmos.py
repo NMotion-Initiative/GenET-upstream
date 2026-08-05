@@ -130,7 +130,7 @@ def _probe_cosmos_data_contract(
     embodiment_map: dict[str, int],
     rank: int,
     world_size: int,
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     """Convert one rank-local sample before constructing the expensive VFM."""
 
     from genet.integrations.cosmos_data import CosmosProcessedPairDataset
@@ -141,6 +141,8 @@ def _probe_cosmos_data_contract(
         fps=project.data.fps,
         reference_mode=project.data.reference_mode,
         reference_seed=project.data.reference_seed,
+        require_bidirectional_pairs=project.data.require_bidirectional_pairs,
+        expected_embodiments=project.data.expected_embodiments,
         action_alignment="frame",
         max_action_dim=project.data.action_dim,
     )
@@ -171,7 +173,10 @@ def _probe_cosmos_data_contract(
                 f"{role} action shape {action_shape} does not match configured {expected_action}; "
                 "run genet-validate-data on every node"
             )
-    return str(sample.get("sample_id", rank % len(dataset)))
+    return (
+        str(sample.get("sample_id", rank % len(dataset))),
+        dataset.direction_summary,
+    )
 
 
 def _validate_local_cosmos_copy(
@@ -194,6 +199,8 @@ def _validate_local_cosmos_copy(
             width=project.data.width,
             action_dim=project.data.action_dim,
             cosmos=True,
+            require_bidirectional_pairs=project.data.require_bidirectional_pairs,
+            expected_embodiments=project.data.expected_embodiments,
             shard_rank=local_rank,
             shard_world_size=local_world_size,
         )
@@ -331,6 +338,10 @@ def _build_cosmos_config(
                         fps=project.data.fps,
                         reference_mode=project.data.reference_mode,
                         reference_seed=project.data.reference_seed,
+                        require_bidirectional_pairs=(
+                            project.data.require_bidirectional_pairs
+                        ),
+                        expected_embodiments=project.data.expected_embodiments,
                         action_alignment="frame",
                         tokenizer_config=model_config.vlm_config.tokenizer,
                         max_caption_tokens=2048,
@@ -492,9 +503,10 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     probe_id: str | None = None
+    direction_summary: dict[str, Any] | None = None
     probe_error: str | None = None
     try:
-        probe_id = _probe_cosmos_data_contract(
+        probe_id, direction_summary = _probe_cosmos_data_contract(
             project,
             manifest=manifest,
             embodiment_map=domains,
@@ -504,7 +516,19 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
     except Exception as exc:
         probe_error = f"{type(exc).__name__}: {exc}"
     raise_if_any_rank_failed("rank-local Cosmos sample probe", probe_error)
-    assert probe_id is not None
+    assert probe_id is not None and direction_summary is not None
+    assert_same_across_ranks("pair_direction_summary", direction_summary)
+    if rank == 0:
+        print(
+            json.dumps(
+                {
+                    "event": "pair_direction_summary",
+                    **direction_summary,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     config = None
     config_error: str | None = None
@@ -529,6 +553,7 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
                         "manifest": str(manifest),
                         "probed_sample": probe_id,
                         "embodiment_map": domains,
+                        "pair_directions": direction_summary,
                         "output": str(Path(project.checkpoint.output_dir).resolve()),
                         "runtime_environment": environment_signature,
                         "world_size": world_size,

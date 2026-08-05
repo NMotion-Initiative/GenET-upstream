@@ -4,16 +4,31 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from genet.data.content import stream_content_sha256
+from genet.data.directions import summarize_pair_directions
 
 _ROLES = ("source", "target", "reference")
 _SUFFIXES = ("video", "actions", "action_mask", "frame_mask")
 _FORMAT_VERSION = "genet.processed-pair/v1"
+
+
+def _iter_manifest_entries(path: Path) -> Iterator[Mapping[str, Any]]:
+    """Stream lightweight metadata for global direction checks."""
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if not isinstance(entry, Mapping):
+                raise ValueError("manifest entry must be an object")
+            yield entry
 
 
 def _issue(
@@ -69,6 +84,67 @@ def _check_finite(
             sample_id=sample_id,
             path=path,
         )
+
+
+def _check_stream_content_hashes(
+    entry: Mapping[str, Any],
+    arrays: Mapping[str, np.ndarray],
+    *,
+    required: bool,
+    issues: list[dict[str, Any]],
+    line: int,
+    sample_id: str,
+    path: Path,
+) -> None:
+    """Bind manifest stream identities to the decompressed NPZ payload."""
+
+    for metadata_role, array_role in (
+        ("source", "source"),
+        ("target_gt", "target"),
+        ("reference_target", "reference"),
+    ):
+        required_arrays = tuple(
+            f"{array_role}_{suffix}" for suffix in _SUFFIXES
+        )
+        if any(name not in arrays for name in required_arrays):
+            continue
+        stream = entry.get(metadata_role)
+        expected = stream.get("content_sha256") if isinstance(stream, Mapping) else None
+        if expected is None and not required:
+            continue
+        if (
+            not isinstance(expected, str)
+            or len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected)
+        ):
+            _issue(
+                issues,
+                code="stream_content_hash_missing",
+                message=(
+                    f"{metadata_role}.content_sha256 must be a lowercase SHA-256"
+                ),
+                line=line,
+                sample_id=sample_id,
+                path=path,
+            )
+            continue
+        actual = stream_content_sha256(
+            video=arrays[f"{array_role}_video"],
+            actions=arrays[f"{array_role}_actions"],
+            action_mask=arrays[f"{array_role}_action_mask"],
+            frame_mask=arrays[f"{array_role}_frame_mask"],
+        )
+        if actual != expected:
+            _issue(
+                issues,
+                code="stream_content_hash_mismatch",
+                message=(
+                    f"{metadata_role}.content_sha256 does not match the NPZ payload"
+                ),
+                line=line,
+                sample_id=sample_id,
+                path=path,
+            )
 
 
 def _check_binary_mask(
@@ -150,6 +226,14 @@ def _check_reference_metadata(
             sample_id=sample_id,
         )
         return
+    if source_embodiment == target_embodiment:
+        _issue(
+            issues,
+            code="same_embodiment_pair",
+            message="source and target_gt must use distinct embodiments",
+            line=line,
+            sample_id=sample_id,
+        )
     if target_embodiment != reference_embodiment:
         _issue(
             issues,
@@ -459,6 +543,8 @@ def validate_manifest(
     width: int | None = None,
     action_dim: int | None = None,
     cosmos: bool = False,
+    require_bidirectional_pairs: bool = False,
+    expected_embodiments: Sequence[str] | None = None,
     shard_rank: int = 0,
     shard_world_size: int = 1,
 ) -> dict[str, Any]:
@@ -487,6 +573,7 @@ def validate_manifest(
             "valid_samples": 0,
             "invalid_samples": 0,
             "expected_num_frames": num_frames,
+            "pair_directions": None,
             "error_count": len(issues),
             "errors": issues,
         }
@@ -502,6 +589,33 @@ def validate_manifest(
         raise ValueError("shard_world_size must be positive")
     if not 0 <= shard_rank < shard_world_size:
         raise ValueError("shard_rank must satisfy 0 <= shard_rank < shard_world_size")
+
+    direction_summary: dict[str, Any] | None = None
+    try:
+        direction_summary = summarize_pair_directions(
+            _iter_manifest_entries(manifest_path),
+            expected_embodiments=expected_embodiments,
+            strict=require_bidirectional_pairs,
+        )
+    except (OSError, ValueError) as exc:
+        if require_bidirectional_pairs:
+            _issue(
+                issues,
+                code="bidirectional_metadata_invalid",
+                message=f"cannot validate pair directions: {exc}",
+                path=manifest_path,
+            )
+    else:
+        if require_bidirectional_pairs and not direction_summary["bidirectional_complete"]:
+            _issue(
+                issues,
+                code="bidirectional_pairs_incomplete",
+                message=(
+                    "manifest does not contain balanced exact Source/Target reverse "
+                    f"records: {direction_summary['errors']}"
+                ),
+                path=manifest_path,
+            )
 
     total = 0
     entry_index = 0
@@ -614,6 +728,15 @@ def validate_manifest(
                     try:
                         with np.load(npz_path, allow_pickle=False) as archive:
                             arrays = {key: archive[key] for key in archive.files}
+                        _check_stream_content_hashes(
+                            entry,
+                            arrays,
+                            required=require_bidirectional_pairs,
+                            issues=issues,
+                            line=line_number,
+                            sample_id=sample_id,
+                            path=npz_path,
+                        )
                         expected_t = _validate_arrays(
                             arrays,
                             expected_t=expected_t,
@@ -653,6 +776,7 @@ def validate_manifest(
         "valid_samples": total - invalid_samples,
         "invalid_samples": invalid_samples,
         "expected_num_frames": expected_t,
+        "pair_directions": direction_summary,
         "error_count": len(issues),
         "errors": issues,
     }
@@ -682,6 +806,23 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--require-bidirectional",
+        action="store_true",
+        help=(
+            "Require every cross-embodiment sample to have an exact reverse record "
+            "and equal Source/Target role marginals"
+        ),
+    )
+    parser.add_argument(
+        "--expected-embodiment",
+        action="append",
+        dest="expected_embodiments",
+        help=(
+            "Repeat for every embodiment required in the complete directed graph; "
+            "canonical RoboTwin v1 training uses all five"
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         help="Optionally also write the JSON summary to this path",
@@ -699,6 +840,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             width=args.width,
             action_dim=args.action_dim,
             cosmos=args.cosmos,
+            require_bidirectional_pairs=args.require_bidirectional,
+            expected_embodiments=args.expected_embodiments,
         )
     except ValueError as exc:
         summary = {
@@ -708,6 +851,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "valid_samples": 0,
             "invalid_samples": 0,
             "expected_num_frames": args.num_frames,
+            "pair_directions": None,
             "error_count": 1,
             "errors": [{"code": "invalid_arguments", "message": str(exc)}],
         }

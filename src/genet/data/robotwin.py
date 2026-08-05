@@ -26,6 +26,8 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from .content import stream_content_sha256
+from .directions import require_bidirectional_pairs, summarize_pair_directions
 from .preprocess import (
     PROCESSED_FORMAT_VERSION,
     PreprocessConfig,
@@ -666,6 +668,12 @@ def _manifest_stream(
     config: RoboTwinPreprocessConfig,
 ) -> dict[str, Any]:
     return {
+        "content_sha256": stream_content_sha256(
+            video=stream.video,
+            actions=stream.actions,
+            action_mask=stream.action_mask,
+            frame_mask=stream.frame_mask,
+        ),
         "episode_id": episode.key.episode_id,
         "embodiment": episode.key.embodiment,
         "clip_start": stream.clip_start,
@@ -781,6 +789,7 @@ def preprocess_robotwin_datasets(
     target_embodiments: Sequence[str] | None = None,
     dataset_root: str | Path | None = None,
     max_samples: int | None = None,
+    require_bidirectional: bool = False,
     overwrite: bool = False,
 ) -> PreprocessReport:
     """Export directed cross-embodiment pairs from random-access MDS readers."""
@@ -798,6 +807,22 @@ def preprocess_robotwin_datasets(
     available = tuple(contract.action_dims)
     sources = _unique_selection(source_embodiments, available, role="source")
     targets = _unique_selection(target_embodiments, available, role="target")
+    if require_bidirectional:
+        expected = set(available)
+        if set(sources) != expected or set(targets) != expected:
+            raise ValueError(
+                "require_bidirectional needs every contract embodiment in both "
+                "source and target selections"
+            )
+        if config.reference_policy != "different_task":
+            raise ValueError(
+                "require_bidirectional requires reference_policy='different_task'"
+            )
+        if max_samples is not None:
+            raise ValueError(
+                "require_bidirectional cannot be combined with max_samples; the global "
+                "cap stops in direction order and is only safe for smoke tests"
+            )
     requested = set(sources) | set(targets)
     unknown = sorted(requested - set(available))
     if unknown:
@@ -879,6 +904,32 @@ def preprocess_robotwin_datasets(
     entries: list[dict[str, Any]] = []
     pair_stats: dict[str, Any] = {}
     dropped_short = 0
+    planned_samples = 0
+    for source_name, target_name in directed_pairs:
+        source_catalog = catalogs[source_name]
+        target_catalog = catalogs[target_name]
+        common = sorted(set(source_catalog) & set(target_catalog))
+        pair_name = f"{source_name}->{target_name}"
+        pair_dropped = 0
+        pair_planned = 0
+        for pair_key in common:
+            starts = _clip_starts(
+                source_catalog[pair_key], target_catalog[pair_key], config
+            )
+            if starts:
+                pair_planned += len(starts)
+            else:
+                pair_dropped += 1
+        planned_samples += pair_planned
+        dropped_short += pair_dropped
+        pair_stats[pair_name] = {
+            "common_episodes": len(common),
+            "dropped_short_episodes": pair_dropped,
+            "planned_samples": pair_planned,
+            "source_only_episodes": len(set(source_catalog) - set(target_catalog)),
+            "target_only_episodes": len(set(target_catalog) - set(source_catalog)),
+            "written_samples": 0,
+        }
     stop = False
 
     for source_name, target_name in directed_pairs:
@@ -886,15 +937,11 @@ def preprocess_robotwin_datasets(
         target_catalog = catalogs[target_name]
         common = sorted(set(source_catalog) & set(target_catalog))
         pair_name = f"{source_name}->{target_name}"
-        pair_written = 0
-        pair_dropped = 0
         for pair_key in common:
             source_episode = source_catalog[pair_key]
             target_episode = target_catalog[pair_key]
             starts = _clip_starts(source_episode, target_episode, config)
             if not starts:
-                pair_dropped += 1
-                dropped_short += 1
                 continue
             for start_t in starts:
                 sample_id = (
@@ -953,7 +1000,17 @@ def preprocess_robotwin_datasets(
                     },
                     "metadata": {
                         "adapter_version": ROBOTWIN_ADAPTER_VERSION,
+                        "base_window_identity": (
+                            f"robotwin-v1:{split}:{pair_key[0]}:episode{pair_key[1]}:"
+                            f"t{start_t}"
+                        ),
                         "camera": config.camera,
+                        "direction": pair_name,
+                        "pair_identity": (
+                            f"robotwin-v1:{split}:{pair_key[0]}:episode{pair_key[1]}:"
+                            f"t{start_t}:{min(source_name, target_name)}<>"
+                            f"{max(source_name, target_name)}"
+                        ),
                         "pairing_policy": "same_split_task_episode_idx",
                         "reference_policy": config.reference_policy,
                         "split": split,
@@ -967,19 +1024,12 @@ def preprocess_robotwin_datasets(
                     ("reference", reference_stream),
                 ):
                     action_stats[role].update(stream.actions, stream.action_mask)
-                pair_written += 1
+                pair_stats[pair_name]["written_samples"] += 1
                 if max_samples is not None and len(entries) >= max_samples:
                     stop = True
                     break
             if stop:
                 break
-        pair_stats[pair_name] = {
-            "common_episodes": len(common),
-            "dropped_short_episodes": pair_dropped,
-            "source_only_episodes": len(set(source_catalog) - set(target_catalog)),
-            "target_only_episodes": len(set(target_catalog) - set(source_catalog)),
-            "written_samples": pair_written,
-        }
         if stop:
             break
 
@@ -988,18 +1038,38 @@ def preprocess_robotwin_datasets(
         for entry in entries
     )
     _atomic_text(manifest_path, manifest_text)
+    by_source: dict[str, list[str]] = {}
     by_target: dict[str, list[str]] = {}
+    by_direction: dict[str, list[str]] = {}
     by_id: dict[str, dict[str, Any]] = {}
     for line_number, entry in enumerate(entries):
         sample_id = entry["id"]
+        source = entry["source"]["embodiment"]
         target = entry["target_gt"]["embodiment"]
+        direction = entry["metadata"]["direction"]
+        by_source.setdefault(source, []).append(sample_id)
         by_target.setdefault(target, []).append(sample_id)
+        by_direction.setdefault(direction, []).append(sample_id)
         by_id[sample_id] = {"line": line_number, "npz": entry["npz"]}
+    direction_summary = (
+        require_bidirectional_pairs(
+            entries,
+            expected_embodiments=available,
+        )
+        if require_bidirectional
+        else summarize_pair_directions(entries)
+    )
     index = {
         "format_version": PROCESSED_FORMAT_VERSION,
         "manifest": manifest_path.name,
         "num_samples": len(entries),
         "by_id": by_id,
+        "by_pair_direction": {
+            key: value for key, value in sorted(by_direction.items())
+        },
+        "by_source_embodiment": {
+            key: value for key, value in sorted(by_source.items())
+        },
         "by_target_embodiment": {
             key: value for key, value in sorted(by_target.items())
         },
@@ -1011,6 +1081,16 @@ def preprocess_robotwin_datasets(
     root_path = (
         Path(dataset_root).expanduser().resolve() if dataset_root is not None else None
     )
+    source_set = set(sources)
+    target_set = set(targets)
+    contract_set = set(available)
+    if source_set == contract_set and target_set == contract_set:
+        direction_policy = "all_contract_ordered_distinct"
+    elif source_set == target_set:
+        direction_policy = "selected_ordered_distinct"
+    else:
+        direction_policy = "selected_directed_cross_product"
+    truncated = len(entries) < planned_samples
     stats = {
         "format_version": PROCESSED_FORMAT_VERSION,
         "adapter_version": ROBOTWIN_ADAPTER_VERSION,
@@ -1030,6 +1110,15 @@ def preprocess_robotwin_datasets(
             key: len(value) for key, value in sorted(catalogs.items())
         },
         "pair_directions": pair_stats,
+        "pairing": {
+            "direction_policy": direction_policy,
+            "source_embodiments": list(sources),
+            "target_embodiments": list(targets),
+            "require_bidirectional": require_bidirectional,
+            "planned_samples": planned_samples,
+            "truncated": truncated,
+            "direction_summary": direction_summary,
+        },
         "written_samples": len(entries),
         "dropped_short_episodes": dropped_short,
         "max_samples_applied": max_samples,
@@ -1061,6 +1150,7 @@ def preprocess_robotwin_mds(
     source_embodiments: Sequence[str] | None = None,
     target_embodiments: Sequence[str] | None = None,
     max_samples: int | None = None,
+    require_bidirectional: bool = False,
     overwrite: bool = False,
 ) -> PreprocessReport:
     """Open requested local MDS streams and export fixed-length GenET pairs."""
@@ -1089,5 +1179,6 @@ def preprocess_robotwin_mds(
         target_embodiments=targets,
         dataset_root=dataset_root,
         max_samples=max_samples,
+        require_bidirectional=require_bidirectional,
         overwrite=overwrite,
     )

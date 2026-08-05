@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from genet.cli.validate_data import validate_manifest
+from genet.data.content import stream_content_sha256
 from genet.data.dataset import ProcessedPairDataset
 from genet.data.preprocess import PreprocessConfig
 from genet.data.robotwin import (
@@ -166,6 +167,33 @@ def _config() -> RoboTwinPreprocessConfig:
     )
 
 
+def test_stream_content_hash_is_layout_and_endian_independent() -> None:
+    video = np.arange(2 * 2 * 3 * 3, dtype=np.uint8).reshape(2, 2, 3, 3)
+    actions = np.arange(8, dtype=np.dtype("<f4")).reshape(2, 4)
+    action_mask = np.ones((2, 4), dtype=np.bool_)
+    frame_mask = np.ones(2, dtype=np.bool_)
+    expected = stream_content_sha256(
+        video=video,
+        actions=actions,
+        action_mask=action_mask,
+        frame_mask=frame_mask,
+    )
+    assert expected == stream_content_sha256(
+        video=np.asfortranarray(video),
+        actions=actions.astype(np.dtype(">f4")),
+        action_mask=np.asfortranarray(action_mask),
+        frame_mask=frame_mask.copy(),
+    )
+    changed = actions.copy()
+    changed[0, 0] += 1
+    assert expected != stream_content_sha256(
+        video=video,
+        actions=changed,
+        action_mask=action_mask,
+        frame_mask=frame_mask,
+    )
+
+
 def test_committed_robotwin_contract_matches_supplied_schema_probe():
     contract = load_robotwin_contract(ROOT / "configs" / "data" / "robotwin_v1.json")
     assert contract.streaming_version == "0.13.0"
@@ -269,6 +297,17 @@ def test_robotwin_direct_export_is_fixed_shape_and_cosmos_valid(tmp_path: Path):
         assert arrays["target_action_mask"][:, :3].all()
         assert not arrays["target_action_mask"][:, 3:].any()
         assert arrays["reference_frame_mask"].all()
+        for manifest_role, array_role in (
+            ("source", "source"),
+            ("target_gt", "target"),
+            ("reference_target", "reference"),
+        ):
+            assert entry[manifest_role]["content_sha256"] == stream_content_sha256(
+                video=arrays[f"{array_role}_video"],
+                actions=arrays[f"{array_role}_actions"],
+                action_mask=arrays[f"{array_role}_action_mask"],
+                frame_mask=arrays[f"{array_role}_frame_mask"],
+            )
 
     validation = validate_manifest(
         report.manifest,
@@ -288,6 +327,193 @@ def test_robotwin_direct_export_is_fixed_shape_and_cosmos_valid(tmp_path: Path):
     assert stats["lineage"]["contract_file_sha256"] == "b" * 64
     assert len(stats["lineage"]["root_manifest_sha256"]) == 64
     assert stats["pair_directions"]["robot-a->robot-b"]["common_episodes"] == 1
+    assert stats["pairing"]["direction_policy"] == "selected_directed_cross_product"
+    assert stats["pairing"]["planned_samples"] == 1
+    assert stats["pairing"]["truncated"] is False
+
+
+def test_robotwin_release_export_materializes_balanced_reverse_directions(
+    tmp_path: Path,
+):
+    datasets = {
+        "robot-a": _Rows(
+            _episode(
+                embodiment="robot-a",
+                task="task-a",
+                episode_idx=0,
+                length=6,
+                dim=2,
+                base=10,
+            )
+            + _episode(
+                embodiment="robot-a",
+                task="task-b",
+                episode_idx=0,
+                length=6,
+                dim=2,
+                base=20,
+            )
+        ),
+        "robot-b": _Rows(
+            _episode(
+                embodiment="robot-b",
+                task="task-a",
+                episode_idx=0,
+                length=6,
+                dim=3,
+                base=30,
+            )
+            + _episode(
+                embodiment="robot-b",
+                task="task-b",
+                episode_idx=0,
+                length=6,
+                dim=3,
+                base=40,
+            )
+        ),
+    }
+    report = preprocess_robotwin_datasets(
+        datasets,
+        tmp_path / "bidirectional",
+        contract=_contract(),
+        split="train",
+        config=_config(),
+        require_bidirectional=True,
+    )
+    entries = [
+        json.loads(line)
+        for line in report.manifest.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(entries) == 4
+    assert {entry["metadata"]["direction"] for entry in entries} == {
+        "robot-a->robot-b",
+        "robot-b->robot-a",
+    }
+    assert all(
+        entry["source"]["embodiment"] != entry["target_gt"]["embodiment"]
+        for entry in entries
+    )
+    assert all(
+        entry["reference_target"]["embodiment"]
+        == entry["target_gt"]["embodiment"]
+        for entry in entries
+    )
+    assert all(
+        entry["reference_target"]["metadata"]["task"]
+        != entry["target_gt"]["metadata"]["task"]
+        for entry in entries
+    )
+
+    by_identity: dict[str, list[dict]] = {}
+    for entry in entries:
+        by_identity.setdefault(entry["metadata"]["pair_identity"], []).append(entry)
+    assert {len(pair) for pair in by_identity.values()} == {2}
+    for forward, reverse in by_identity.values():
+        if forward["source"]["embodiment"] == "robot-b":
+            forward, reverse = reverse, forward
+        assert (
+            forward["source"]["content_sha256"]
+            == reverse["target_gt"]["content_sha256"]
+        )
+        assert (
+            forward["target_gt"]["content_sha256"]
+            == reverse["source"]["content_sha256"]
+        )
+        forward_npz = report.manifest.parent / forward["npz"]
+        reverse_npz = report.manifest.parent / reverse["npz"]
+        with np.load(forward_npz, allow_pickle=False) as a, np.load(
+            reverse_npz, allow_pickle=False
+        ) as b:
+            for suffix in ("video", "actions", "action_mask", "frame_mask"):
+                np.testing.assert_array_equal(
+                    a[f"source_{suffix}"], b[f"target_{suffix}"]
+                )
+                np.testing.assert_array_equal(
+                    a[f"target_{suffix}"], b[f"source_{suffix}"]
+                )
+
+    validation = validate_manifest(
+        report.manifest,
+        cosmos=True,
+        require_bidirectional_pairs=True,
+    )
+    assert validation["valid"] is True
+    assert validation["pair_directions"]["bidirectional_complete"] is True
+    dataset = ProcessedPairDataset(
+        report.manifest, require_bidirectional_pairs=True
+    )
+    assert dataset.direction_summary["direction_counts"] == {
+        "robot-a->robot-b": 2,
+        "robot-b->robot-a": 2,
+    }
+    stats = json.loads(report.stats.read_text(encoding="utf-8"))
+    assert stats["pairing"]["direction_policy"] == "all_contract_ordered_distinct"
+    assert stats["pairing"]["planned_samples"] == 4
+    assert stats["pairing"]["truncated"] is False
+
+    with pytest.raises(ValueError, match="cannot be combined with max_samples"):
+        preprocess_robotwin_datasets(
+            datasets,
+            tmp_path / "truncated",
+            contract=_contract(),
+            split="train",
+            config=_config(),
+            max_samples=2,
+            require_bidirectional=True,
+        )
+
+    capped = preprocess_robotwin_datasets(
+        datasets,
+        tmp_path / "capped",
+        contract=_contract(),
+        split="train",
+        config=_config(),
+        max_samples=1,
+    )
+    capped_stats = json.loads(capped.stats.read_text(encoding="utf-8"))
+    assert capped_stats["pairing"]["direction_policy"] == (
+        "all_contract_ordered_distinct"
+    )
+    assert capped_stats["pairing"]["planned_samples"] == 4
+    assert capped_stats["pairing"]["truncated"] is True
+    assert set(capped_stats["pair_directions"]) == {
+        "robot-a->robot-b",
+        "robot-b->robot-a",
+    }
+    assert capped_stats["pair_directions"]["robot-b->robot-a"][
+        "written_samples"
+    ] == 0
+
+
+def test_robotwin_release_requires_full_contract_set_and_different_task_policy(
+    tmp_path: Path,
+):
+    contract = replace(
+        _contract(),
+        action_dims={"robot-a": 2, "robot-b": 3, "robot-c": 2},
+    )
+    with pytest.raises(ValueError, match="every contract embodiment"):
+        preprocess_robotwin_datasets(
+            {"robot-a": _Rows([]), "robot-b": _Rows([])},
+            tmp_path / "subset",
+            contract=contract,
+            split="train",
+            config=_config(),
+            source_embodiments=("robot-a", "robot-b"),
+            target_embodiments=("robot-a", "robot-b"),
+            require_bidirectional=True,
+        )
+
+    with pytest.raises(ValueError, match="reference_policy='different_task'"):
+        preprocess_robotwin_datasets(
+            {"robot-a": _Rows([]), "robot-b": _Rows([])},
+            tmp_path / "reference-policy",
+            contract=_contract(),
+            split="train",
+            config=replace(_config(), reference_policy="any_task"),
+            require_bidirectional=True,
+        )
 
 
 def test_catalog_rejects_noncontiguous_or_inconsistent_action_windows():

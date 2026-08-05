@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from . import directions as pair_directions
 from .preprocess import PROCESSED_FORMAT_VERSION
 from .reference import StatelessReferencePool
 
@@ -78,6 +80,12 @@ class ProcessedPairDataset(Dataset[dict[str, Any]]):
         reference_mode: ``stored`` uses preprocessing's reference. ``deterministic``
             reselects a target clip of the same embodiment from the full manifest,
             excluding the current target episode.
+        require_bidirectional_pairs: Require every directed sample to have its
+            exact Source/Target-swapped counterpart and balanced role marginals.
+            This validates materialized bidirectional data; it never swaps a
+            stored reference at runtime.
+        expected_embodiments: Optional complete inventory whose ordered
+            cross-product must be present when the strict gate is enabled.
         shard_by_rank: Slice the global manifest as ``rank, rank+world_size, ...``.
             This is useful when every RoCE node has a complete local data copy. Do
             not additionally use a DistributedSampler when this is enabled.
@@ -91,10 +99,12 @@ class ProcessedPairDataset(Dataset[dict[str, Any]]):
         reference_mode: str = "stored",
         reference_seed: int = 0,
         reference_per_epoch: bool = False,
+        require_bidirectional_pairs: bool = False,
+        expected_embodiments: Sequence[str] | None = None,
         normalize_video: str = "minus_one_one",
         shard_by_rank: bool = False,
-        global_rank: Optional[int] = None,
-        world_size: Optional[int] = None,
+        global_rank: int | None = None,
+        world_size: int | None = None,
     ) -> None:
         path = Path(manifest).expanduser().resolve()
         if path.is_dir():
@@ -107,6 +117,10 @@ class ProcessedPairDataset(Dataset[dict[str, Any]]):
             reference_mode = "deterministic"
         if reference_mode not in {"stored", "deterministic"}:
             raise ValueError("reference_mode must be 'stored' or 'deterministic'")
+        if not isinstance(require_bidirectional_pairs, bool):
+            raise ValueError("require_bidirectional_pairs must be boolean")
+        if isinstance(expected_embodiments, (str, bytes)):
+            raise ValueError("expected_embodiments must be a sequence of names")
         if normalize_video not in {"minus_one_one", "zero_one", "none"}:
             raise ValueError(
                 "normalize_video must be 'minus_one_one', 'zero_one', or 'none'"
@@ -119,6 +133,10 @@ class ProcessedPairDataset(Dataset[dict[str, Any]]):
         self.reference_mode = reference_mode
         self.reference_seed = int(reference_seed)
         self.reference_per_epoch = bool(reference_per_epoch)
+        self.require_bidirectional_pairs = require_bidirectional_pairs
+        self.expected_embodiments = (
+            tuple(expected_embodiments) if expected_embodiments is not None else None
+        )
         self.normalize_video = normalize_video
         self.shard_by_rank = bool(shard_by_rank)
         self.global_rank = (
@@ -165,6 +183,11 @@ class ProcessedPairDataset(Dataset[dict[str, Any]]):
                 streams[role] = metadata
             target = streams["target_gt"]
             reference = streams["reference_target"]
+            source = streams["source"]
+            if source["embodiment"] == target["embodiment"]:
+                raise ValueError(
+                    f"processed entry {entry['id']!r} must pair distinct embodiments"
+                )
             if reference["embodiment"] != target["embodiment"]:
                 raise ValueError(
                     f"processed entry {entry['id']!r} reference embodiment differs from target"
@@ -177,6 +200,14 @@ class ProcessedPairDataset(Dataset[dict[str, Any]]):
             embodiment = target.get("embodiment")
             assert isinstance(episode_id, str) and isinstance(embodiment, str)
             candidates.append(_TargetCandidate(index, episode_id, embodiment))
+        self.direction_summary = (
+            pair_directions.require_bidirectional_pairs(
+                self.entries,
+                expected_embodiments=self.expected_embodiments,
+            )
+            if self.require_bidirectional_pairs
+            else pair_directions.summarize_pair_directions(self.entries)
+        )
         self._reference_pool = StatelessReferencePool(
             candidates, seed=self.reference_seed
         )

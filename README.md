@@ -73,20 +73,44 @@ physical timestamps, so `--mds-index-fps 16` explicitly declares one MDS row per
   --split train \
   --mds-index-fps 16 \
   --camera head \
+  --reference-policy different_task \
+  --require-bidirectional \
   --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train
 ```
 
 The default creates one `T=81` clip at each matched episode start for every ordered pair of distinct embodiments when
-both Source and Target contain at least 81 frames. Short pairs are counted in `dropped_short`. Use repeatable
-`--source-embodiment` and `--target-embodiment` flags to restrict directions. The optional `sliding` policy is
-experimental until a reviewed cross-embodiment phase-retiming rule exists. Validate before training:
+both Source and Target contain at least 81 frames. With five embodiments this covers 20 directions, including both
+`A->B` and `B->A`; each direction stores a separate reference from its current Target embodiment. The release flag also
+proves exact reverse coverage and rejects the direction-biased global `--max-samples` cap. Do not add a second random
+Source/Target swap in the Dataset. Validate before training:
 
 ```bash
 genet-validate-data \
   --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl \
   --num-frames 81 --height 192 --width 320 --action-dim 64 \
-  --cosmos
+  --cosmos \
+  --require-bidirectional \
+  --expected-embodiment ARX-X5 \
+  --expected-embodiment aloha-agilex \
+  --expected-embodiment franka-panda \
+  --expected-embodiment piper \
+  --expected-embodiment ur5-wsg
 ```
+
+This validates the canonical five-embodiment inventory and exact reciprocal records in the static manifest. It does
+not promise exact `A->B`/`B->A` exposure in every training epoch or arbitrary `max_steps` prefix: distributed loading
+uses a without-replacement shuffle of `floor(N/WORLD_SIZE) * WORLD_SIZE` records and rotates the at-most
+`WORLD_SIZE-1` omitted tail records across epochs. The startup `pair_direction_summary` describes manifest inventory,
+not samples consumed so far.
+
+The exporter records a versioned `content_sha256` for every Source, Target, and Reference stream. Strict validation
+recomputes those identities from the decompressed NPZ arrays and requires the Source/Target hashes to swap in every
+reverse record, so reciprocal metadata cannot hide unrelated payloads.
+
+A strict release combines four independent requirements: preprocessing explicitly uses
+`--reference-policy different_task`, training uses `data.reference_mode=stored`, canonical validation pins the five
+expected embodiments and reciprocal coverage, and the published content lock hashes the processed manifest, NPZs,
+`index.json`, and `stats.json`. Changing any of those inputs creates a new release rather than an in-place update.
 
 The original `genet-preprocess` command remains available for file-based `genet.raw-pair/v1` JSONL datasets; see
 [Preprocessing](docs/PREPROCESSING.md).

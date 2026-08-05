@@ -7,11 +7,11 @@ added without changing the preprocessing core.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Optional
-
+from typing import Any
 
 SCHEMA_VERSION = "genet.raw-pair/v1"
 
@@ -67,7 +67,7 @@ def _required_string(data: Mapping[str, Any], key: str, context: str) -> str:
 
 def _optional_positive_float(
     data: Mapping[str, Any], key: str, context: str
-) -> Optional[float]:
+) -> float | None:
     value = data.get(key)
     if value is None:
         return None
@@ -93,20 +93,20 @@ class EpisodeRef:
     video: Path
     actions: Path
     start_time: float = 0.0
-    end_time: Optional[float] = None
-    video_fps: Optional[float] = None
-    action_fps: Optional[float] = None
+    end_time: float | None = None
+    video_fps: float | None = None
+    action_fps: float | None = None
     action_start_time: float = 0.0
-    action_timestamps: Optional[Path] = None
-    video_key: Optional[str] = None
-    action_key: Optional[str] = None
-    timestamp_key: Optional[str] = None
+    action_timestamps: Path | None = None
+    video_key: str | None = None
+    action_key: str | None = None
+    timestamp_key: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict, compare=False, hash=False)
 
     @classmethod
     def from_dict(
         cls, data: Mapping[str, Any], *, base_dir: Path, context: str
-    ) -> "EpisodeRef":
+    ) -> EpisodeRef:
         if not isinstance(data, Mapping):
             raise SchemaError(f"{context} must be an object")
 
@@ -148,7 +148,7 @@ class EpisodeRef:
         if action_start < 0:
             raise SchemaError(f"{context}.action_start_time must be >= 0")
 
-        def optional_string(key: str) -> Optional[str]:
+        def optional_string(key: str) -> str | None:
             value = data.get(key)
             if value is not None and (not isinstance(value, str) or not value):
                 raise SchemaError(f"{context}.{key} must be a non-empty string")
@@ -174,7 +174,7 @@ class EpisodeRef:
         )
 
     @property
-    def pool_key(self) -> tuple[str, str, str, float, Optional[float]]:
+    def pool_key(self) -> tuple[str, str, str, float, float | None]:
         """Stable key used to de-duplicate reference-pool entries."""
 
         return (
@@ -205,13 +205,13 @@ class PairRecord:
     sample_id: str
     source: EpisodeRef
     target_gt: EpisodeRef
-    reference_target: Optional[EpisodeRef] = None
+    reference_target: EpisodeRef | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict, compare=False, hash=False)
 
     @classmethod
     def from_dict(
         cls, data: Mapping[str, Any], *, base_dir: Path, context: str
-    ) -> "PairRecord":
+    ) -> PairRecord:
         if not isinstance(data, Mapping):
             raise SchemaError(f"{context} must be an object")
         sample_id = data.get("id", data.get("sample_id"))
@@ -225,6 +225,10 @@ class PairRecord:
         target = EpisodeRef.from_dict(
             data["target_gt"], base_dir=base_dir, context=f"{context}.target_gt"
         )
+        if source.embodiment == target.embodiment:
+            raise SchemaError(
+                f"{context} must pair distinct source and target_gt embodiments"
+            )
         reference_data = data.get("reference_target")
         reference = (
             EpisodeRef.from_dict(
@@ -289,7 +293,7 @@ def read_raw_manifest(path: str | Path) -> list[PairRecord]:
 def build_reference_candidates(records: Iterable[PairRecord]) -> list[EpisodeRef]:
     """Collect unique target-embodiment clips for the implicit reference pool."""
 
-    candidates: dict[tuple[str, str, str, float, Optional[float]], EpisodeRef] = {}
+    candidates: dict[tuple[str, str, str, float, float | None], EpisodeRef] = {}
     for record in records:
         candidates.setdefault(record.target_gt.pool_key, record.target_gt)
         if record.reference_target is not None:

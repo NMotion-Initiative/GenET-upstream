@@ -1,5 +1,14 @@
 _base_: ../base.yaml
 
+data:
+  expected_embodiments:
+    - ARX-X5
+    - aloha-agilex
+    - franka-panda
+    - piper
+    - ur5-wsg
+  require_bidirectional_pairs: true
+
 model:
   backend: cosmos3_edge
   latent_channels: 48
@@ -17,4 +26,3 @@ train:
 
 checkpoint:
   output_dir: outputs/stage2_no_ref_8gpu
-

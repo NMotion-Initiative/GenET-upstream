@@ -208,7 +208,9 @@ T = 1 + N × temporal_compression_factor
   --height 192 \
   --width 320 \
   --action-dim 64 \
-  --action-resample linear
+  --action-resample linear \
+  --reference-policy different_task \
+  --require-bidirectional
 ```
 
 预处理输出的 manifest 为 `/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl`。用
@@ -223,7 +225,13 @@ genet-validate-data \
   --height 192 \
   --width 320 \
   --action-dim 64 \
-  --cosmos
+  --cosmos \
+  --require-bidirectional \
+  --expected-embodiment ARX-X5 \
+  --expected-embodiment aloha-agilex \
+  --expected-embodiment franka-panda \
+  --expected-embodiment piper \
+  --expected-embodiment ur5-wsg
 ```
 
 然后计算并比较 manifest 与统计文件的 SHA256。至少校验：
@@ -237,11 +245,38 @@ genet-validate-data \
 
 训练时禁止“遇到坏样本就跳过”。不同 rank 跳过不同数量的样本会让 collective 次数不一致并最终 hang；坏样本应在预处理或 `genet-validate-data` 阶段隔离。
 
+RoboTwin 正式数据按有向本体组合物化：5 个本体对应 20 个方向，每个 `A→B` 都有使用同一
+task/episode/window 的 `B→A`，但两个方向各自从“当前 Target 本体”选择 stored Reference。不能在 Dataset
+里只交换 Source/Target tensor；否则 reference、domain、raw action dim 和 mask 都会属于错误角色。六个
+Cosmos production 配置均设置 `data.require_bidirectional_pairs: true`，启动前会检查 exact reverse、方向计数、
+每本体 Source/Target 边际，并在日志输出 `pair_direction_summary`。
+
+`pair_direction_summary` 只描述静态 manifest 的 reciprocal inventory，不是训练至当前 step 已消费样本的统计。
+训练 sampler 对 directed manifest 做无放回、可恢复的 rank-local epoch shuffle，不使用 replacement 权重采样；
+每个 epoch 全局消费 `floor(N/WORLD_SIZE)×WORLD_SIZE` 条记录，最多省略 `WORLD_SIZE-1` 条，并通过 epoch rotation
+让尾部记录不会永久丢失。因此完整 manifest 保持 A↔B 对称，但单个 epoch（尤其被 tail 截断时）和任意
+`max_steps` prefix 都不保证两个方向曝光数严格相等。需要审计实际利用率时，应从已消费 batch metadata 另行累计
+per-direction exposure，而不能把启动时的 manifest summary 当作消费计数。
+
+比较 shared/dual/no-ref 时必须固定同一 directed manifest、reference、seed、max steps 和 global batch，并同时
+报告 manifest 的 `directed_samples`、`unique_pair_windows`、per-direction inventory，以及训练实际消费的
+per-direction exposure。`--max-samples` 按方向顺序提前停止，只允许单向 smoke test，不能进入 production lock。
+未来 action normalization 也必须按 train split 的 unique 本体/episode/timestep 统计，不能直接使用因 20 个方向
+重复曝光而加权的 role aggregate。
+
+严格 release 同时固定四层条件：export 使用 `--reference-policy different_task`，production config 使用
+`data.reference_mode=stored`，canonical validator 要求上述五个 `--expected-embodiment` 与 exact reverse，cluster
+content lock 则哈希 manifest、全部 NPZ、`index.json`、`stats.json` 和批准的 normalization artifact。任何一层变化
+都必须生成新的 release ID 与 lock。
+validator 还会从解压后的四类数组重新计算每一路 `content_sha256`，并要求反向记录交换 Source/Target hash，防止
+仅交换 metadata、却继续使用无关 payload 的伪反向样本通过 release gate。
+
 Cosmos3-Edge production bridge 还有三项硬约束：
 
 - `data.action_dim` 必须是 64，原始本体动作可以少于 64 维，但有效通道必须是从 0 开始的连续前缀；bridge 会补零到 64 并传递 `raw_action_dim`；
 - `model.num_embodiments` 必须是 32，manifest 中实际本体名按排序稳定映射到 32 个 domain slot，实际种类不能超过 32；
 - 当前 Cosmos loss bridge 尚不消费 temporal padding mask，因而 production 数据必须用 `short_policy=drop`。只要任一路 `frame_mask` 含无效帧，或 action 在时间轴上含 padded step，bridge 会 fail-fast，而不是把 padding 送入 loss。
+- `data.require_bidirectional_pairs` 在所有 S1/S2/S3 production 配置中必须保持开启；关闭只适用于明确标记的 directed smoke/ablation。
 
 训练配置的 `data.reference_mode` 默认为 `stored`，直接使用预处理时写入 NPZ 的 reference。切到 `deterministic` 后，Dataset 会依据 `data.reference_seed` 从 processed manifest 的同本体、不同 target episode 中稳定重选；两种模式会改变实验数据，必须写入 run metadata，shared/dual 间不得混用。
 
@@ -491,7 +526,9 @@ checkpoint 的 node publish ID 保持一致。c10d elastic rendezvous 会按 joi
 第一次提交某个配置时，先在四节点命令末尾增加 `--dry-run`。production dry-run 会初始化 process group、
 比较运行时环境 contract，解析固定 upstream recipe、确认 DCP 目录含 `.metadata`、确认 `WAN_VAE_PATH` 存在、
 比较 manifest/语义配置/embodiment map，并由每个节点的 8 个 local rank 并行分片完成一次等价于
-`genet-validate-data --cosmos` 的全量校验；随后每个 rank 再读取、转换自己的首个 global-rank shard 样本。
+`genet-validate-data --cosmos --require-bidirectional` 的全量 shape/reciprocity 校验；随后每个 rank 再读取、转换
+自己的首个 global-rank shard 样本。这个 dry-run 不替代预处理阶段带五个 `--expected-embodiment` 的 canonical
+inventory 验证，也不替代 content-lock hash verification。
 它不会构造昂贵模型或进入 optimizer step。通过后再去掉该参数。
 
 ## 9. RoCE/NCCL 环境与诊断
@@ -870,7 +907,8 @@ genet-generate-long \
 - [ ] `genet-cluster-lock verify --receipt ...` 已在四节点通过，manifest、NPZ、stats、normalization、VAE、
       实际 load DCP 与 HF cache 一致且绑定到运行路径；
 - [ ] 单进程/节点 `scripts/preflight_roce.sh` 已通过；
-- [ ] 数据已通过 `genet-validate-data`，无训练期 skip；
+- [ ] 数据已通过 `genet-validate-data --cosmos --require-bidirectional`，且 expected embodiment 集合严格为
+      `ARX-X5, aloha-agilex, franka-panda, piper, ur5-wsg`，无训练期 skip；
 - [ ] `T=1+4N`，Source/Target/Reference shape 与配置一致；
 - [ ] effective global batch 已按 DP degree 计算；
 - [ ] shared/dual 使用同一 warm-start、seed、reference 与样本预算；

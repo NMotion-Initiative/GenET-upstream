@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 
 from genet.cli.validate_data import main, validate_manifest
+from genet.data.content import stream_content_sha256
 
 
 def _arrays(*, time: int = 5, height: int = 4, width: int = 6, dim: int = 3):
@@ -27,6 +28,27 @@ def _entry(sample_id: str, npz: str) -> dict:
         "target_gt": {"episode_id": "target-0", "embodiment": "ur5"},
         "reference_target": {"episode_id": "target-1", "embodiment": "ur5"},
     }
+
+
+def _bind_strict_metadata(entry: dict, arrays: dict, *, pair_identity: str) -> None:
+    entry["metadata"] = {
+        "pair_identity": pair_identity,
+        "reference_policy": "different_task",
+    }
+    for metadata_role, array_role, task in (
+        ("source", "source", "paired-task"),
+        ("target_gt", "target", "paired-task"),
+        ("reference_target", "reference", "reference-task"),
+    ):
+        stream = entry[metadata_role]
+        stream["clip_start"] = 0.0
+        stream["metadata"] = {"task": task}
+        stream["content_sha256"] = stream_content_sha256(
+            video=arrays[f"{array_role}_video"],
+            actions=arrays[f"{array_role}_actions"],
+            action_mask=arrays[f"{array_role}_action_mask"],
+            frame_mask=arrays[f"{array_role}_frame_mask"],
+        )
 
 
 def test_validate_manifest_accepts_complete_fixed_shape_dataset(tmp_path: Path):
@@ -151,3 +173,91 @@ def test_cosmos_validation_rejects_padding_and_non_uint8_video(tmp_path: Path):
     assert "cosmos_video_dtype" in codes
     assert "cosmos_temporal_video_padding" in codes
     assert "cosmos_temporal_action_padding" in codes
+
+
+def test_validator_reports_global_bidirectional_coverage(tmp_path: Path, capsys):
+    forward_arrays = _arrays()
+    forward_arrays["source_video"].fill(1)
+    forward_arrays["target_video"].fill(2)
+    forward_arrays["reference_video"].fill(3)
+    reverse_arrays = _arrays()
+    for suffix in ("video", "actions", "action_mask", "frame_mask"):
+        reverse_arrays[f"source_{suffix}"] = forward_arrays[f"target_{suffix}"].copy()
+        reverse_arrays[f"target_{suffix}"] = forward_arrays[f"source_{suffix}"].copy()
+    reverse_arrays["reference_video"].fill(4)
+    np.savez_compressed(tmp_path / "forward.npz", **forward_arrays)
+    np.savez_compressed(tmp_path / "reverse.npz", **reverse_arrays)
+    forward = _entry("forward", "forward.npz")
+    _bind_strict_metadata(
+        forward, forward_arrays, pair_identity="window-0:franka<>ur5"
+    )
+    reverse = {
+        **_entry("reverse", "reverse.npz"),
+        "source": dict(forward["target_gt"]),
+        "target_gt": dict(forward["source"]),
+        "reference_target": {
+            "episode_id": "source-reference",
+            "embodiment": "franka",
+        },
+        "metadata": dict(forward["metadata"]),
+    }
+    _bind_strict_metadata(
+        reverse, reverse_arrays, pair_identity="window-0:franka<>ur5"
+    )
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        json.dumps(forward) + "\n" + json.dumps(reverse) + "\n",
+        encoding="utf-8",
+    )
+    valid = validate_manifest(
+        manifest,
+        cosmos=True,
+        require_bidirectional_pairs=True,
+        expected_embodiments=["franka", "ur5"],
+        shard_rank=1,
+        shard_world_size=2,
+    )
+    assert valid["valid"] is True
+    assert valid["samples"] == 1
+    assert valid["pair_directions"]["directed_samples"] == 2
+    assert valid["pair_directions"]["bidirectional_complete"] is True
+
+    assert (
+        main(
+            [
+                "--manifest",
+                str(manifest),
+                "--cosmos",
+                "--require-bidirectional",
+                "--expected-embodiment",
+                "franka",
+                "--expected-embodiment",
+                "ur5",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+
+    tampered = {key: value.copy() for key, value in reverse_arrays.items()}
+    tampered["target_video"][0, 0, 0, 0] = 99
+    np.savez_compressed(tmp_path / "reverse.npz", **tampered)
+    invalid_hash = validate_manifest(
+        manifest,
+        require_bidirectional_pairs=True,
+        expected_embodiments=["franka", "ur5"],
+    )
+    assert "stream_content_hash_mismatch" in {
+        error["code"] for error in invalid_hash["errors"]
+    }
+
+    manifest.write_text(json.dumps(forward) + "\n", encoding="utf-8")
+    invalid = validate_manifest(
+        manifest,
+        require_bidirectional_pairs=True,
+        expected_embodiments=["franka", "ur5"],
+    )
+    assert invalid["valid"] is False
+    assert "bidirectional_pairs_incomplete" in {
+        error["code"] for error in invalid["errors"]
+    }

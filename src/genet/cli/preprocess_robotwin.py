@@ -109,6 +109,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--require-bidirectional",
+        action="store_true",
+        help=(
+            "Production guard: require every contract embodiment in both roles, "
+            "different_task references, every reverse direction, and no --max-samples"
+        ),
+    )
+    parser.add_argument(
         "--skip-action-window-validation",
         action="store_true",
         help=(
@@ -158,6 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "split": args.split,
                     "source_embodiments": args.source_embodiments,
                     "target_embodiments": args.target_embodiments,
+                    "require_bidirectional": args.require_bidirectional,
                     "config": asdict(config),
                 },
                 indent=2,
@@ -174,6 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source_embodiments=args.source_embodiments,
         target_embodiments=args.target_embodiments,
         max_samples=args.max_samples,
+        require_bidirectional=args.require_bidirectional,
         overwrite=args.overwrite,
     )
     print(

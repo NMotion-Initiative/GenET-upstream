@@ -9,6 +9,10 @@ data:
   action_dim: 64
   reference_mode: stored
   reference_seed: 1234
+  expected_embodiments: []
+  # Generic manifests may be directed. Production RoboTwin overlays enable the
+  # stricter materialized A->B / B->A completeness gate.
+  require_bidirectional_pairs: false
 
 loader:
   micro_batch_size: 1

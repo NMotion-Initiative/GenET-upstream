@@ -391,6 +391,8 @@ bash scripts/run_hyperbolic_container.sh \
     --schema /opt/genet/configs/data/robotwin_v1.json \
     --split train \
     --mds-index-fps 16 \
+    --reference-policy different_task \
+    --require-bidirectional \
     --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train \
     --print-config
 ```
@@ -426,22 +428,34 @@ bash scripts/run_hyperbolic_container.sh \
       --height 192 \
       --width 320 \
       --action-dim 64 \
-      --action-resample linear
+      --action-resample linear \
+      --reference-policy different_task \
+      --require-bidirectional
     /opt/genet-preprocess-venv/bin/python -m genet.cli.validate_data \
       --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl \
       --num-frames 81 \
       --height 192 \
       --width 320 \
       --action-dim 64 \
-      --cosmos
+      --cosmos \
+      --require-bidirectional \
+      --expected-embodiment ARX-X5 \
+      --expected-embodiment aloha-agilex \
+      --expected-embodiment franka-panda \
+      --expected-embodiment piper \
+      --expected-embodiment ur5-wsg
   '
 ```
 
 The default `episode_start` policy emits one clip for every matched episode and every ordered pair of distinct
-embodiments when both sides cover the full `T=81` window; shorter pairs are counted in `dropped_short`. Repeat
-`--source-embodiment` and `--target-embodiment` to restrict directions. The default stored Reference comes from the
-Target embodiment and split but a different task and episode. Production must keep
-`reference_mode=stored`; the generic runtime pool has weaker task-exclusion semantics.
+embodiments when both sides cover the full `T=81` window; shorter pairs are counted in `dropped_short`. The release gate
+requires exact reciprocal records, equal `A->B`/`B->A` counts, and equal per-embodiment Source/Target marginals. Each
+direction stores its own Reference from the current Target embodiment and a different task/episode; never add a random
+runtime swap on top. Restricted directions and global `--max-samples` are smoke-test-only. Production must keep
+`reference_mode=stored`; the generic runtime pool has weaker task-exclusion semantics. These gates prove static manifest
+inventory. They do not guarantee equal per-direction consumption in each distributed epoch or arbitrary training
+prefix: the loader rotates at most `WORLD_SIZE-1` omitted tail records across epochs, and the startup direction summary
+is not a consumed-sample counter.
 
 The trainer consumes the locked train manifest. Export `val` separately before releasing the preparation node so the
 fixed validation split is also checked and available for evaluation:
@@ -450,18 +464,36 @@ fixed validation split is also checked and available for evaluation:
 bash scripts/run_hyperbolic_container.sh \
   "${GENET_PREP_HOST_ENV}" \
   "${GENET_IMAGE_REF}" \
-  /opt/genet-preprocess-venv/bin/python -m genet.cli.preprocess_robotwin \
-    --root /mnt/nvme/mds-cache/robotwin_v1 \
-    --schema /opt/genet/configs/data/robotwin_v1.json \
-    --split val \
-    --mds-index-fps 16 \
-    --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/val \
-    --num-frames 81 \
-    --sample-fps 16 \
-    --height 192 \
-    --width 320 \
-    --action-dim 64 \
-    --action-resample linear
+  bash -lc '
+    set -euo pipefail
+    /opt/genet-preprocess-venv/bin/python -m genet.cli.preprocess_robotwin \
+      --root /mnt/nvme/mds-cache/robotwin_v1 \
+      --schema /opt/genet/configs/data/robotwin_v1.json \
+      --split val \
+      --mds-index-fps 16 \
+      --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/val \
+      --num-frames 81 \
+      --sample-fps 16 \
+      --height 192 \
+      --width 320 \
+      --action-dim 64 \
+      --action-resample linear \
+      --reference-policy different_task \
+      --require-bidirectional
+    /opt/genet-preprocess-venv/bin/python -m genet.cli.validate_data \
+      --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/val/manifest.jsonl \
+      --num-frames 81 \
+      --height 192 \
+      --width 320 \
+      --action-dim 64 \
+      --cosmos \
+      --require-bidirectional \
+      --expected-embodiment ARX-X5 \
+      --expected-embodiment aloha-agilex \
+      --expected-embodiment franka-panda \
+      --expected-embodiment piper \
+      --expected-embodiment ur5-wsg
+  '
 ```
 
 Add the validation tree to a separate evaluation lock if an evaluation job consumes it; do not silently add it to a
@@ -478,6 +510,13 @@ The safest no-shared-storage workflow is to preprocess once and copy the resulti
 `/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train` directory byte-for-byte to the other three nodes. Independently
 preprocessing all four raw copies is permitted only if every result later matches the same content lock. Do not train
 from a copy that merely has the same sample count.
+
+For both train and validation, strict release means the exporter used `different_task`, training uses stored references,
+the canonical validator saw all five expected embodiments with exact reverse coverage, and the release lock hashes the
+manifest, all NPZ payloads, `index.json`, `stats.json`, and any approved normalization artifact. Copying to another node
+is complete only after those hashes verify; matching counts or filenames are insufficient. The validator also
+recomputes each stream's manifest `content_sha256` from decompressed arrays and requires reverse Source/Target hashes to
+swap, while keeping each direction's Reference identity independent.
 
 ### 5.3 Stage model artifacts
 
@@ -1044,7 +1083,8 @@ Do not start paid production training until every item is true:
 - [ ] every node exposes eight GPUs, contains the prewarmed RoboTwin cache, and has enough free space under `/mnt/nvme`;
 - [ ] every node pulled the same OCI digest and the embedded GenET revision matches;
 - [ ] the direct RoboTwin MDS adapter validated the approved schema and recorded the declared index FPS;
-- [ ] canonical preprocessing and `genet-validate-data --cosmos` passed;
+- [ ] canonical train and validation preprocessing passed with `different_task`, and
+      `genet-validate-data --cosmos --require-bidirectional` passed with all five expected embodiments;
 - [ ] every node verified the same cluster lock and created its own receipt;
 - [ ] the receipt binds the actual manifest, Wan VAE, HF cache, and exact load DCP paths;
 - [ ] the four-node CPU/Gloo preflight passed with unique node identities;

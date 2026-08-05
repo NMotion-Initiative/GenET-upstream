@@ -264,6 +264,8 @@ def run_standalone_training(
         sample_format="generic",
         reference_mode=config.data.reference_mode,
         reference_seed=config.data.reference_seed,
+        require_bidirectional_pairs=config.data.require_bidirectional_pairs,
+        expected_embodiments=config.data.expected_embodiments,
         shard_by_rank=False,
     )
     if len(dataset) == 0:
@@ -271,6 +273,7 @@ def run_standalone_training(
     _validate_sample_contract(dataset[context.rank % len(dataset)], config)
     domains = _domain_map(dataset, config.model.num_embodiments)
     assert_same_across_ranks("embodiment_map", domains)
+    assert_same_across_ranks("pair_direction_summary", dataset.direction_summary)
     sampler = DistributedSampler(
         dataset,
         num_replicas=context.world_size,
@@ -377,6 +380,7 @@ def run_standalone_training(
                         * context.world_size
                     ),
                     "embodiment_map": domains,
+                    "pair_directions": dataset.direction_summary,
                     "parameters": counts,
                     "precision": str(precision).removeprefix("torch."),
                 },

@@ -138,7 +138,10 @@ split + task + episode_idx
 
 Their embodiments must differ. A missing episode is reported for the affected direction and is never replaced by a
 different episode. By default, every ordered pair of distinct embodiments is exported. Repeat
-`--source-embodiment NAME` and `--target-embodiment NAME` to restrict storage and experiments to selected directions.
+`--source-embodiment NAME` and `--target-embodiment NAME` only for a deliberate directed smoke/ablation export. Canonical
+train and validation releases use `--require-bidirectional`: Source and Target selections must be identical, every
+`A->B` record must have the exact `B->A` episode/window counterpart, reverse direction counts must match, and each
+embodiment must appear equally often in the Source and Target roles.
 
 The default Reference Target is selected with a stable BLAKE2-based index from candidates that have:
 
@@ -150,6 +153,10 @@ The default Reference Target is selected with a stable BLAKE2-based index from c
 The reference episode and its random fixed-length start are written into the processed manifest. Production training
 must use `reference_mode=stored` so the release keeps this task-exclusion policy. The generic Dataset's dynamic pool only
 guarantees same embodiment and different episode.
+
+Do not implement bidirectionality by swapping one processed sample inside `__getitem__`: that sample's stored Reference
+belongs to the old Target. The v1 release materializes both directions and independently selects a valid Reference for
+the new Target. A future storage-optimized virtual-direction format would need two direction-specific references.
 
 ## 5. Time semantics and fixed length
 
@@ -201,6 +208,9 @@ streams before `--max-samples` limits writes):
   --output /mnt/nvme/mds-cache/robotwin_v1/genet/smoke/train
 ```
 
+This global cap stops in direction order and is smoke-test-only. It is intentionally incompatible with
+`--require-bidirectional`; never place a capped tree in a production training lock.
+
 For the canonical train export:
 
 ```bash
@@ -217,6 +227,7 @@ For the canonical train export:
   --action-dim 64 \
   --action-resample linear \
   --reference-policy different_task \
+  --require-bidirectional \
   --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train
 ```
 
@@ -244,9 +255,15 @@ Each NPZ contains Source, Target, and Reference arrays:
 ```
 
 All frame masks and every real action channel are true in production output. The manifest stores split, task,
-embodiment, episode index, camera, declared MDS index FPS, raw action width, action alignment, and action signal. The
-stats receipt stores the committed adapter-contract checksum, the supplied observed-schema checksum, and the node's
-top-level MDS `manifest.json` checksum.
+embodiment, episode index, camera, declared MDS index FPS, raw action width, action alignment, action signal,
+order-independent pair identity, and directed role. `index.json` indexes Source, Target, and direction. The stats receipt
+stores the committed adapter-contract checksum, the supplied observed-schema checksum, the node's top-level MDS
+`manifest.json` checksum, direction histogram, Source/Target role marginals, directed sample count, and unique reciprocal
+pair-window count.
+
+Each manifest stream also carries a versioned `content_sha256` over its canonical video, actions, action mask, and frame
+mask. Strict validation recomputes it after NPZ decompression and verifies that reverse records swap the Source/Target
+hashes; Reference hashes remain direction-specific because each direction samples from its current Target embodiment.
 
 ## 8. Validate before training
 
@@ -257,11 +274,25 @@ top-level MDS `manifest.json` checksum.
   --height 192 \
   --width 320 \
   --action-dim 64 \
-  --cosmos
+  --cosmos \
+  --require-bidirectional \
+  --expected-embodiment ARX-X5 \
+  --expected-embodiment aloha-agilex \
+  --expected-embodiment franka-panda \
+  --expected-embodiment piper \
+  --expected-embodiment ur5-wsg
 ```
 
 `--cosmos` additionally rejects non-uint8 video, temporal padding, action-mask holes, and non-prefix action channels.
-Do not train merely because sample counts look plausible; require a clean validation result and a content lock.
+`--require-bidirectional` scans the complete lightweight manifest metadata even when local ranks divide the expensive
+NPZ validation. The repeated `--expected-embodiment` values make this a canonical RoboTwin release check rather than a
+reciprocity check over an arbitrary symmetric subset. These checks describe the static manifest; they do not imply that
+every distributed epoch or an early-stop prefix consumes exactly equal counts from both directions.
+
+The strict release contract also fixes `--reference-policy different_task` at export and
+`data.reference_mode=stored` at training. After validation, publish a content lock covering `manifest.jsonl`, every
+referenced NPZ, `index.json`, `stats.json`, and the approved normalization artifact when present. A matching sample count
+or direction histogram is not a substitute for those hashes.
 
 ## 9. Four nodes without shared storage
 

@@ -28,6 +28,8 @@ class DataConfig:
     action_dim: int = 64
     reference_mode: Literal["stored", "deterministic"] = "stored"
     reference_seed: int = 1234
+    expected_embodiments: list[str] = field(default_factory=list)
+    require_bidirectional_pairs: bool = False
 
 
 @dataclass
@@ -131,6 +133,31 @@ class ProjectConfig:
     def validate(self, world_size: int | None = None) -> None:
         if self.data.reference_mode not in {"stored", "deterministic"}:
             raise ValueError("data.reference_mode must be 'stored' or 'deterministic'")
+        expected_embodiments = self.data.expected_embodiments
+        if not isinstance(expected_embodiments, list):
+            raise ValueError("data.expected_embodiments must be a list")
+        if any(
+            not isinstance(embodiment, str) or not embodiment.strip()
+            for embodiment in expected_embodiments
+        ):
+            raise ValueError(
+                "data.expected_embodiments must contain only non-empty strings"
+            )
+        if len(set(expected_embodiments)) != len(expected_embodiments):
+            raise ValueError("data.expected_embodiments must not contain duplicates")
+        if not isinstance(self.data.require_bidirectional_pairs, bool):
+            raise ValueError("data.require_bidirectional_pairs must be boolean")
+        if self.data.require_bidirectional_pairs:
+            if not expected_embodiments:
+                raise ValueError(
+                    "data.require_bidirectional_pairs requires non-empty "
+                    "data.expected_embodiments"
+                )
+            if self.data.reference_mode != "stored":
+                raise ValueError(
+                    "data.require_bidirectional_pairs requires "
+                    "data.reference_mode='stored'"
+                )
         if self.data.num_frames < 1:
             raise ValueError("data.num_frames must be positive")
         if self.data.height < 1 or self.data.width < 1:
