@@ -555,7 +555,10 @@ def _update_main_ref(path: Path, revision: str, *, force: bool) -> None:
             raise FileExistsError(
                 f"{path} points at {current!r}; pass --force to repoint it to {revision}"
             )
-    _atomic_text(path, revision + "\n")
+    # No trailing newline: huggingface_hub's offline ref resolution uses the
+    # file content verbatim as the snapshot directory name, and a newline
+    # breaks `revision="main"` lookups while online lookups mask the bug.
+    _atomic_text(path, revision)
 
 
 def _require_ref_compatible(path: Path, revision: str, *, force: bool) -> None:
