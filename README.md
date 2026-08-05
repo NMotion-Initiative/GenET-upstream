@@ -7,9 +7,9 @@ GenET is a Cosmos3-Edge training project for cross-robot-embodiment generation. 
 
 The model jointly generates a Target Embodiment video and action sequence that follows the Source task semantics and
 timing. Supervised training still requires a paired `target_gt`; the reference only supplies Target appearance, motion,
-and action-space priors. The current `genet.processed-pair/v1` contract excludes the `target_gt` episode when selecting a
-reference, but it does not yet exclude every sample from the same task. Task-level leakage prevention remains a TODO for
-the final dataschema.
+and action-space priors. The generic raw-pair path excludes the `target_gt` episode. The fixed RoboTwin-v1 adapter is
+stricter by default: it selects a stored reference from the same Target embodiment and split, but from a different task
+and episode.
 
 > **Implementation status:** preprocessing, validation, lightweight joint rectified-flow training, the shared/dual
 > reference ablation, a conditional Cosmos sampling API, checkpoints, and `81/17` rolling-window long-horizon
@@ -43,31 +43,53 @@ Detailed documentation:
 
 ## Quick Start
 
-Install the lightweight training, preprocessing, and test dependencies:
+Do not install into Ubuntu's externally managed system Python. No Miniconda is required; create a project virtual
+environment (install `python3-full` first if `venv` is missing):
 
 ```bash
-python -m pip install -e '.[preprocess,dev]'
+# Run apt-get directly as root, or prefix it with sudo as a normal user.
+apt-get update
+apt-get install -y python3-full
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e '.[preprocess,robotwin,dev]'
 ```
 
-Inspect the raw JSONL schema:
+Production preprocessing and training should instead use the same immutable Docker image. The default environment is
+the frozen Cosmos training runtime; RoboTwin preprocessing is deliberately isolated in
+`/opt/genet-preprocess-venv` because `mosaicml-streaming==0.13.0` and the Cosmos lock require incompatible NumPy
+versions. Running one OCI digest gives all four nodes the same container Python environments without mutating Cosmos
+dependencies.
+
+For the fixed node-local RoboTwin schema, export directed cross-embodiment pairs directly from MDS. The cache has no
+physical timestamps, so `--mds-index-fps 16` explicitly declares one MDS row per canonical 16 Hz GenET index:
 
 ```bash
-genet-preprocess --print-raw-schema
+# Inside the production image. In the local venv, use the unqualified command.
+/opt/genet-preprocess-venv/bin/python -m genet.cli.preprocess_robotwin \
+  --root /mnt/nvme/mds-cache/robotwin_v1 \
+  --schema configs/data/robotwin_v1.json \
+  --split train \
+  --mds-index-fps 16 \
+  --camera head \
+  --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train
 ```
 
-Synchronize and crop all three vision–action streams to `T=81`:
+The default creates one `T=81` clip at each matched episode start for every ordered pair of distinct embodiments when
+both Source and Target contain at least 81 frames. Short pairs are counted in `dropped_short`. Use repeatable
+`--source-embodiment` and `--target-embodiment` flags to restrict directions. The optional `sliding` policy is
+experimental until a reviewed cross-embodiment phase-retiming rule exists. Validate before training:
 
 ```bash
-genet-preprocess \
-  --manifest data/raw/train.jsonl \
-  --output data/processed/train \
-  --config configs/schema.example.json
-
 genet-validate-data \
-  --manifest data/processed/train/manifest.jsonl \
+  --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl \
   --num-frames 81 --height 192 --width 320 --action-dim 64 \
   --cosmos
 ```
+
+The original `genet-preprocess` command remains available for file-based `genet.raw-pair/v1` JSONL datasets; see
+[Preprocessing](docs/PREPROCESSING.md).
 
 Run the repository tests and a lightweight dry run:
 
@@ -125,6 +147,30 @@ The project pins Cosmos Framework to:
 a904d2d36b774a51dd06ff9ff906816b1a04f579
 ```
 
+The exact reviewed artifacts come from the official
+[`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) and
+[`Wan-AI/Wan2.2-TI2V-5B`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B) repositories and are pinned in
+`configs/checkpoints/cosmos3_edge.json`. Inside the immutable image on
+the staging node, one command downloads the complete Cosmos3-Edge snapshot and Wan VAE, verifies every indexed model
+shard plus the VAE byte count/SHA-256, converts the snapshot to DCP, writes a recursive DCP SHA-256 manifest, updates the
+offline HF ref, and publishes an artifact receipt under one run-root lock:
+
+```bash
+bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet
+
+# Later, with networking disabled:
+bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet --verify-only
+```
+
+The resulting paths are `/mnt/nvme/genet/hf-cache`,
+`/mnt/nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth`, and
+`/mnt/nvme/genet/checkpoints/Cosmos3-Edge`. No separate Wan DiT, DROID policy, Reasoner checkpoint, ControlNet, or
+reference encoder checkpoint is required for S1; the new GenET branches initialize during training.
+`HF_HOME` must be exactly `/mnt/nvme/genet/hf-cache`; use only an ephemeral `HF_TOKEN` environment variable if access
+policy requires authentication, because the script rejects persisted token files in the replicated cache.
+Budget at least 100 GB free for the current 29.5 GB Cosmos snapshot, 2.82 GB Wan VAE, converted DCP, temporary files,
+and any explicitly preserved `--force` backup.
+
 For interactive bring-up inside the NVIDIA Cosmos training container:
 
 ```bash
@@ -153,9 +199,10 @@ docker push registry.example/genet:${GENET_REVISION}
 
 Building from `git archive HEAD` deliberately excludes dirty and untracked working-tree files. The virtual revision file
 is checked against the image build argument, remains available to the runtime preflight, and prevents arbitrary source
-from being labeled as that commit. The image retains the versioned `configs/` and `scripts/`, installs GenET as a wheel,
-and writes a sorted `pip freeze` plus its checksum into `/opt`. Record the pushed image digest; never rely on a mutable tag
-for a multi-node run.
+from being labeled as that commit. The image retains the versioned `configs/` and `scripts/`, installs GenET in the
+frozen Cosmos training venv without resolving new dependencies, and builds a separate `/opt/genet-preprocess-venv` for
+RoboTwin. Sorted package inventories and checksums for both environments are written under `/opt`. Record the pushed
+image digest; never rely on a mutable tag for a multi-node run.
 
 ## Multi-Node Training Without Shared Storage
 
@@ -190,13 +237,14 @@ artifact root are rejected.
 genet-cluster-lock create \
   --output /staging/genet-release/cluster-lock.json \
   --artifact processed_data=/staging/genet/data/processed/train \
-  --artifact wan_vae=/staging/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth \
+  --artifact wan_vae=/staging/genet/artifacts/wan22_vae/Wan2.2_VAE.pth \
+  --artifact artifact_receipt=/staging/genet/artifacts/ARTIFACTS.json \
   --artifact training_checkpoint=/staging/genet/checkpoints/stage2_shared_committed \
   --artifact normalization=/staging/genet/data/normalization \
   --artifact hf_cache=/staging/genet/hf-cache
 ```
 
-If the temporary dataschema has no normalization artifact yet, omit that logical entry from both the create and verify
+If this release has no approved normalization artifact yet, omit that logical entry from both the create and verify
 commands. `training_checkpoint` must point to the exact DCP passed through `--warm-start`, `--resume`, or
 `BASE_CHECKPOINT_PATH` for this job: use the Cosmos3-Edge base DCP for S1, the selected prior-stage DCP for S2/S3, and the
 prestaged committed DCP for resume. Hashing the full processed dataset is intentionally a staging/deployment operation
@@ -211,7 +259,8 @@ genet-cluster-lock verify \
   --lock /local_nvme/genet/release/cluster-lock.json \
   --receipt /local_nvme/genet/release/node-receipt.json \
   --artifact processed_data=/local_nvme/genet/data/processed/train \
-  --artifact wan_vae=/local_nvme/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth \
+  --artifact wan_vae=/local_nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth \
+  --artifact artifact_receipt=/local_nvme/genet/artifacts/ARTIFACTS.json \
   --artifact training_checkpoint=/local_nvme/genet/checkpoints/stage2_shared_committed \
   --artifact normalization=/local_nvme/genet/data/normalization \
   --artifact hf_cache=/local_nvme/genet/hf-cache
@@ -233,8 +282,8 @@ export GENET_CODE_REVISION='<40-hex-GenET-commit>'
 export GENET_COSMOS_REVISION='a904d2d36b774a51dd06ff9ff906816b1a04f579'
 export GENET_CLUSTER_LOCK=/local_nvme/genet/release/cluster-lock.json
 export GENET_CLUSTER_RECEIPT=/local_nvme/genet/release/node-receipt.json
-export GENET_HF_SNAPSHOT_REVISION='<Cosmos3-Edge-HF-commit>'
-export WAN_VAE_PATH=/local_nvme/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth
+export GENET_HF_SNAPSHOT_REVISION='2a00e87e9976dc3ed5533dd18caf4cdbc3a1bcb2'
+export WAN_VAE_PATH=/local_nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth
 export HF_HOME=/local_nvme/genet/hf-cache
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -342,7 +391,7 @@ src/genet/cli/              preprocessing, validation, training, lock, checkpoin
 tests/                      data, model, training, checkpoint, environment, and generation tests
 ```
 
-## Current Data Contract and Dataschema TODOs
+## Current Data Contract and Remaining Semantic Decisions
 
 `genet.processed-pair/v1` requires fixed, equal Source, Target GT, and Reference lengths. Video is `[T,H,W,3]`; action
 and dimension/time masks are `[T,64]`. The repository provides generic linear and nearest action resampling, but the final
@@ -352,11 +401,14 @@ dataschema still needs to define:
 - SO(3)/SE(3)-aware interpolation and frame conventions;
 - the exact observation/action timestamp offset;
 - train-split-only normalization statistics;
-- task-level reference exclusion, dataset versioning, and lineage;
+- dataset versioning and lineage for non-RoboTwin adapters (RoboTwin references already exclude the target task);
 - rational timebases and terminal stop/padding semantics for long Source episodes;
 - embodiment-specific joint/SE(3)/gripper quality thresholds, kinematics, and safety gates.
 
-These are explicit schema extension points. The pipeline must not silently guess robot action semantics.
+The fixed RoboTwin adapter now validates the structural fields, dimensions, episode ordering, overlapping action
+windows, pairing key, and reference leakage policy. Its `state` signal is explicitly labeled `joint_position_state`, not
+an executable actuator command. Physical timestamps, train-only normalization, coordinate frames, and robot-specific
+safety semantics remain explicit schema extension points; the pipeline does not silently guess them.
 
 ## Upstream Projects and Licensing
 

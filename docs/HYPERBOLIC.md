@@ -19,10 +19,10 @@ nodes see the same filesystem. Each node must have its own complete copies, and 
 the cluster-lock verification described below. Local NVMe may also disappear when a cloud instance is terminated;
 publish checkpoints and inference journals to durable storage before releasing any node.
 
-> **Current data boundary:** GenET consumes a `genet.raw-pair/v1` JSONL manifest. The final RoboTwin-v1-to-GenET manifest
-> adapter is intentionally still a TODO until the project-specific dataschema defines action fields, units, coordinate
-> frames, normalization, task IDs, and timestamps. The preprocessing commands below are executable after that manifest
-> exists; they do not guess those semantics from the RoboTwin directory tree.
+> **Current data boundary:** the fixed RoboTwin-v1 MDS adapter is implemented and directly validates the supplied
+> manifest, columns, action widths, aggregate counts, episodes, pairing keys, and reference policy. The MDS `state` is
+> intentionally labeled measured `joint_position_state`; physical timestamps, units/frames, train-only normalization,
+> and executable command semantics are not present in the source schema and remain explicit downstream decisions.
 
 ## 1. Deployment contract
 
@@ -52,8 +52,6 @@ Keep immutable training inputs under the actual cache mount and mutable run stat
   genet/processed/train/      manifest.jsonl, index.json, stats.json, samples/*.npz
 
 /mnt/nvme/genet/
-  data/raw/
-    train.jsonl               genet.raw-pair/v1; paths point into the prewarmed cache
   normalization/             optional train-split-only normalization artifacts
   artifacts/
     wan22_vae/Wan2.2_VAE.pth
@@ -68,8 +66,8 @@ Keep immutable training inputs under the actual cache mount and mutable run stat
   inference/                 long-generation RUN.json and immutable chunk NPZs
 ```
 
-Keep the existing RoboTwin layout in place and make `data/raw/train.jsonl` point at the real media with absolute paths.
-Do not move or rewrite the original data merely to match this example.
+Keep the existing RoboTwin MDS layout in place. The direct adapter reads it in situ and writes only the processed GenET
+tree shown above; it does not require an intermediate media export or raw-pair JSONL.
 
 For shell examples, set a task-specific variable rather than repurposing a system variable:
 
@@ -174,6 +172,13 @@ export COSMOS_DEPENDENCY_GROUP=cu130-train
 
 bash scripts/build_hyperbolic_image.sh
 
+docker run --rm --gpus all "${GENET_IMAGE_TAG}" \
+  python -c 'import cosmos_framework, genet, numpy, torch; assert numpy.__version__ == "2.2.6"; print(torch.__version__, torch.version.cuda)'
+docker run --rm --gpus all "${GENET_IMAGE_TAG}" \
+  /opt/genet-preprocess-venv/bin/python -c 'import genet, numpy, streaming; assert tuple(map(int, numpy.__version__.split(".")[:2])) < (2, 2)'
+docker image inspect --format 'bytes={{.Size}}' "${GENET_IMAGE_TAG}"
+docker history "${GENET_IMAGE_TAG}"
+
 docker push "${GENET_IMAGE_TAG}"
 export GENET_IMAGE_REF="$(docker image inspect --format '{{index .RepoDigests 0}}' "${GENET_IMAGE_TAG}")"
 [[ "${GENET_IMAGE_REF}" =~ @sha256:[0-9a-f]{64}$ ]]
@@ -195,22 +200,25 @@ export GENET_IMAGE_REF='registry.example/genet@sha256:<pushed-image-digest>'
 Authenticate the four nodes to the registry using the provider's credential mechanism, pull that exact digest, and
 confirm it is available. The SSH launcher can fan out the pull, but it must never convert `GENET_IMAGE_REF` back to a
 tag. The image contains versioned `configs/` and `scripts/` under `/opt/genet`, the installed GenET wheel, the pinned
-Cosmos checkout, and a sorted package inventory.
+Cosmos checkout, and package inventories for both Python environments. Its default PATH is the frozen Cosmos training
+venv. RoboTwin preprocessing runs from `/opt/genet-preprocess-venv`; this separation prevents Streaming's NumPy
+constraint from changing the Cosmos lock.
 
 ## 5. Prepare RoboTwin v1 once, then replicate the bytes
 
-### 5.1 Create the raw pair manifest
+### 5.1 Confirm the fixed MDS contract and semantic choices
 
-After the project-specific dataschema adapter is added, scan the node-local cache and generate:
-
-```text
-/mnt/nvme/genet/data/raw/train.jsonl
-```
+The repository now consumes the probed RoboTwin-v1 MDS schema directly through
+`configs/data/robotwin_v1.json`; no intermediate raw-pair JSONL is needed. The adapter opens each aggregate at
+`{root}/{split}/{embodiment}`, validates every row and episode, and pairs Source/Target only when `split`, `task`, and
+`episode_idx` match.
 
 Copy `configs/cluster/hyperbolic_4x8.env.example` to a private preparation-host file, replace its placeholders, add
 `NODE_RANK=0`, set `GENET_CONTAINER_NAME=genet-preprocess`, and set `GENET_CACHE_READONLY=0`. The cache is writable only
 while the designated preparation node creates the canonical processed tree; restore `GENET_CACHE_READONLY=1` before
-validation locks or training. Inspect the temporary schema through that same digest-pinned container environment:
+validation locks or training. This write access is also required because MosaicML Streaming can lazily materialize
+compressed `.mds.zstd` shards beside the source shards on first access. Inspect the resolved adapter configuration
+through that same digest-pinned container environment:
 
 ```bash
 export GENET_PREP_HOST_ENV=/secure/path/preprocess.host.env
@@ -219,12 +227,19 @@ export GENET_IMAGE_REF='registry.example/genet@sha256:<pushed-image-digest>'
 bash scripts/run_hyperbolic_container.sh \
   "${GENET_PREP_HOST_ENV}" \
   "${GENET_IMAGE_REF}" \
-  genet-preprocess --print-raw-schema
+  /opt/genet-preprocess-venv/bin/python -m genet.cli.preprocess_robotwin \
+    --root /mnt/nvme/mds-cache/robotwin_v1 \
+    --schema /opt/genet/configs/data/robotwin_v1.json \
+    --split train \
+    --mds-index-fps 16 \
+    --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train \
+    --print-config
 ```
 
-Each JSONL record must contain paired `source` and `target_gt` streams. `reference_target` may be supplied explicitly or
-selected deterministically from the same Target embodiment while excluding the `target_gt` episode. Task-level
-reference exclusion is not implemented by v1 and must be enforced by the final manifest adapter.
+`--mds-index-fps 16` is a declared canonical index cadence: the MDS has integer `t` but no timestamps, so it must not be
+described as a recovered physical camera clock. The adapter labels the per-row `state` as frame-aligned
+`joint_position_state`; it does not claim this measured state is an executable actuator command. Change this value only
+as a reviewed data-semantics decision, then keep it identical for every release.
 
 ### 5.2 Run canonical preprocessing
 
@@ -240,19 +255,20 @@ bash scripts/run_hyperbolic_container.sh \
   "${GENET_IMAGE_REF}" \
   bash -lc '
     set -euo pipefail
-    python -c "import av; from PIL import Image"
-    genet-preprocess \
-      --manifest /mnt/nvme/genet/data/raw/train.jsonl \
+    /opt/genet-preprocess-venv/bin/python -c "import streaming; from PIL import Image"
+    /opt/genet-preprocess-venv/bin/python -m genet.cli.preprocess_robotwin \
+      --root /mnt/nvme/mds-cache/robotwin_v1 \
+      --schema /opt/genet/configs/data/robotwin_v1.json \
+      --split train \
+      --mds-index-fps 16 \
       --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train \
-      --config /opt/genet/configs/schema.example.json \
       --num-frames 81 \
       --sample-fps 16 \
       --height 192 \
       --width 320 \
       --action-dim 64 \
-      --short-policy drop \
       --action-resample linear
-    genet-validate-data \
+    /opt/genet-preprocess-venv/bin/python -m genet.cli.validate_data \
       --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl \
       --num-frames 81 \
       --height 192 \
@@ -262,9 +278,18 @@ bash scripts/run_hyperbolic_container.sh \
   '
 ```
 
-The immutable image build validates the preprocessing imports (`av` and `Pillow`) before it can succeed. The explicit
-import above fails early if a different image is selected accidentally; do not resolve dependencies separately on each
-node.
+The default `episode_start` policy emits one clip for every matched episode and every ordered pair of distinct
+embodiments when both sides cover the full `T=81` window; shorter pairs are counted in `dropped_short`. Repeat
+`--source-embodiment` and `--target-embodiment` to restrict directions. The default stored Reference comes from the
+Target embodiment and split but a different task and episode. Production must keep
+`reference_mode=stored`; the generic runtime pool has weaker task-exclusion semantics.
+
+The immutable image build validates `streaming==0.13.0` and Pillow in the isolated preprocessing venv. Do not resolve
+dependencies separately on each node. The raw MDS cache is a staging input and is not part of the training release lock;
+the finished processed tree is the locked training artifact. After a successful full export, restore
+`GENET_CACHE_READONLY=1` before copying or training. Restricted-direction exports and failed runs can leave only some
+compressed shards materialized; that is acceptable for the staging cache but never evidence that preprocessing
+completed. Completion is established by the export's exact aggregate-count checks, Cosmos validation, and content lock.
 
 The safest no-shared-storage workflow is to preprocess once and copy the resulting
 `/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train` directory byte-for-byte to the other three nodes. Independently
@@ -281,78 +306,47 @@ On the same canonical preparation node:
    `${GENET_NODE_RUN_ROOT}/artifacts/wan22_vae/Wan2.2_VAE.pth`;
 3. convert the official Cosmos3-Edge checkpoint to a DCP at
    `${GENET_NODE_RUN_ROOT}/checkpoints/Cosmos3-Edge` using the pinned Cosmos conversion entry point;
-4. write train-split-only normalization artifacts under `${GENET_NODE_RUN_ROOT}/normalization` when the final dataschema
-   provides them.
+4. write train-split-only normalization artifacts under `${GENET_NODE_RUN_ROOT}/normalization` once that policy and its
+   per-embodiment fields are approved.
 
-Resolve and approve the full Cosmos3-Edge repository commit while the preparation node is online; do not use `main` as
-the production identity. The following private staging environment must set `NODE_RANK=0`, a unique container name,
-`HF_HOME=/mnt/nvme/genet/hf-cache`, and `GENET_ALLOW_HF_TOKEN=1`. Add `HF_TOKEN` only if the account requires one; Docker
-can inspect that environment variable while the short-lived preparation container exists, so never reuse this private
-environment for training:
+The reviewed artifact identities are versioned in `configs/checkpoints/cosmos3_edge.json`. As of this release they are
+Cosmos3-Edge revision `2a00e87e9976dc3ed5533dd18caf4cdbc3a1bcb2`, Wan VAE revision
+`921dbaf3f1674a56f47e83fb80a34bac8a8f203e`, and Wan file SHA-256
+`20eb789667fa5e60e7516bf509512f6cb61f01b0aa0695eadaea930c13892b36`. The following single command downloads the exact
+snapshot and VAE, validates all mandatory/indexed model shards, updates the offline `refs/main`, converts the snapshot to
+DCP, records a recursive DCP SHA-256 manifest, and writes
+`/mnt/nvme/genet/artifacts/ARTIFACTS.json`:
 
 ```bash
-export GENET_HF_SNAPSHOT_REVISION="$(
-  bash scripts/run_hyperbolic_container.sh \
-    /secure/path/download.host.env \
-    "${GENET_IMAGE_REF}" \
-    python -c 'from huggingface_hub import HfApi; print(HfApi().model_info("nvidia/Cosmos3-Edge", revision="main").sha)'
-)"
-
-[[ "${GENET_HF_SNAPSHOT_REVISION}" =~ ^[0-9a-f]{40}$ ]]
-
 bash scripts/run_hyperbolic_container.sh \
   /secure/path/download.host.env \
   "${GENET_IMAGE_REF}" \
-  bash -c '
-    set -euo pipefail
-    revision="$1"
-    hf download nvidia/Cosmos3-Edge --revision "${revision}"
-    ref_dir="${HF_HOME}/hub/models--nvidia--Cosmos3-Edge/refs"
-    mkdir -p "${ref_dir}"
-    printf "%s\n" "${revision}" > "${ref_dir}/main"
-    test "$(cat "${ref_dir}/main")" = "${revision}"
-  ' bash "${GENET_HF_SNAPSHOT_REVISION}"
-
-bash scripts/run_hyperbolic_container.sh \
-  /secure/path/download.host.env \
-  "${GENET_IMAGE_REF}" \
-  hf download Wan-AI/Wan2.2-TI2V-5B Wan2.2_VAE.pth \
-    --revision 921dbaf3f1674a56f47e83fb80a34bac8a8f203e \
-    --local-dir /mnt/nvme/genet/artifacts/wan22_vae
+  bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet
 ```
 
-The explicit `refs/main` file makes every later offline Cosmos lookup of the registered `Cosmos3-Edge` name resolve to
-the approved snapshot rather than a mutable network ref. Record `GENET_HF_SNAPSHOT_REVISION` in every private job
-environment. Inject download credentials only into the one preparation container, never into the shared production job
-environment. After staging is complete, production uses:
+Run the same command later with `--verify-only` for an offline, non-mutating check. Use
+`--cosmos-revision <reviewed-40-hex>` only for an intentional upgrade. `--resolve-main` explicitly queries the mutable
+upstream branch and records the result, but it must go through review before becoming a release identity. A conflicting
+existing `refs/main`, VAE, or DCP is rejected; `--force` is required to replace it, and an old DCP is preserved under a
+timestamped backup name.
+
+The private staging environment must set `NODE_RANK=0`, a unique container name,
+`HF_HOME=/mnt/nvme/genet/hf-cache`, and `GENET_ALLOW_HF_TOKEN=1`. Add `HF_TOKEN` only if the account requires one; Docker
+can inspect that environment while the short-lived preparation container exists, so never reuse it for training.
+The script writes `refs/main` so the pinned upstream recipe's offline catalog lookup resolves to the reviewed snapshot.
+After staging, record the spec revision in every job environment and use:
 
 ```bash
 export HF_HOME="${GENET_NODE_RUN_ROOT}/hf-cache"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export GENET_HF_SNAPSHOT_REVISION=2a00e87e9976dc3ed5533dd18caf4cdbc3a1bcb2
 export WAN_VAE_PATH="${GENET_NODE_RUN_ROOT}/artifacts/wan22_vae/Wan2.2_VAE.pth"
 ```
 
-Convert the exact local snapshot with the pinned Cosmos entry point inside the immutable container. Use another private
-host environment copy with `GENET_CONTAINER_NAME=genet-convert`; its `HF_HOME` and
-`GENET_HF_SNAPSHOT_REVISION` must point at the already populated cache and approved commit:
-
-```bash
-bash scripts/run_hyperbolic_container.sh \
-  /secure/path/convert.host.env \
-  "${GENET_IMAGE_REF}" \
-  bash -lc '
-    set -euo pipefail
-    GENET_EDGE_SNAPSHOT="${HF_HOME}/hub/models--nvidia--Cosmos3-Edge/snapshots/${GENET_HF_SNAPSHOT_REVISION}"
-    test -f "${GENET_EDGE_SNAPSHOT}/config.json"
-    python -m cosmos_framework.scripts.convert_model_to_dcp \
-      -o /mnt/nvme/genet/checkpoints/Cosmos3-Edge \
-      --checkpoint-path "${GENET_EDGE_SNAPSHOT}"
-  '
-```
-
-The conversion command is the interface for the repository's pinned Cosmos revision. Do not substitute a standalone
-PyTorch checkpoint or a partially downloaded model directory for the resulting DCP.
+The script passes the exact local snapshot to the pinned Cosmos conversion interface. Do not substitute a standalone
+PyTorch checkpoint, the mutable catalog name, or a partially downloaded directory for the resulting DCP. The training
+load path is `/mnt/nvme/genet/checkpoints/Cosmos3-Edge`; `model/.metadata` lives beneath it.
 
 For S1, the `training_checkpoint` artifact is the converted Cosmos3-Edge base DCP. For S2/S3 it is the exact committed
 checkpoint selected from the previous stage. For an exact resume it is the complete committed DCP being resumed. Never
@@ -366,11 +360,20 @@ root on all four hosts:
 - `/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train`;
 - `normalization`, if present;
 - `artifacts/wan22_vae`;
+- `artifacts/ARTIFACTS.json`;
 - the exact base/warm-start/resume DCP;
 - `hf-cache`.
 
 Copy into dedicated destinations without deleting unrelated files. A successful copy is not accepted until the
-cluster-lock verification succeeds on that node.
+offline artifact verifier and cluster-lock verification both succeed on that node. Because all Hyperbolic nodes use the
+same `/mnt/nvme/genet` layout, the copied artifact receipt remains valid:
+
+```bash
+bash scripts/run_hyperbolic_container.sh \
+  /secure/path/lock.host.env \
+  "${GENET_IMAGE_REF}" \
+  bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet --verify-only
+```
 
 When the preparation node is rank 0 and the coordinator, this non-destructive pattern copies the canonical processed
 tree to ranks 1–3. Run analogous `rsync -aH --partial` commands for the model/cache trees listed above; deliberately omit
@@ -408,6 +411,7 @@ bash scripts/run_hyperbolic_container.sh \
       --output "${GENET_RELEASE_DIR}/cluster-lock.json" \
       --artifact processed_data="${GENET_PROCESSED_DATA}" \
       --artifact wan_vae="${GENET_NODE_RUN_ROOT}/artifacts/wan22_vae/Wan2.2_VAE.pth" \
+      --artifact artifact_receipt="${GENET_NODE_RUN_ROOT}/artifacts/ARTIFACTS.json" \
       --artifact training_checkpoint="${GENET_NODE_RUN_ROOT}/checkpoints/Cosmos3-Edge" \
       --artifact hf_cache="${GENET_NODE_RUN_ROOT}/hf-cache"
   '
@@ -428,6 +432,7 @@ bash scripts/run_hyperbolic_container.sh \
       --receipt "${GENET_RELEASE_DIR}/node-receipt.json" \
       --artifact processed_data="${GENET_PROCESSED_DATA}" \
       --artifact wan_vae="${GENET_NODE_RUN_ROOT}/artifacts/wan22_vae/Wan2.2_VAE.pth" \
+      --artifact artifact_receipt="${GENET_NODE_RUN_ROOT}/artifacts/ARTIFACTS.json" \
       --artifact training_checkpoint="${GENET_NODE_RUN_ROOT}/checkpoints/Cosmos3-Edge" \
       --artifact hf_cache="${GENET_NODE_RUN_ROOT}/hf-cache"
   '
@@ -480,7 +485,7 @@ export GENET_CODE_REVISION='<full-40-character-GenET-commit>'
 export GENET_COSMOS_REVISION='a904d2d36b774a51dd06ff9ff906816b1a04f579'
 export GENET_CLUSTER_LOCK=/mnt/nvme/genet/release/<release-id>/cluster-lock.json
 export GENET_CLUSTER_RECEIPT=/mnt/nvme/genet/release/<release-id>/node-receipt.json
-export GENET_HF_SNAPSHOT_REVISION='<full-40-character-HF-repository-commit>'
+export GENET_HF_SNAPSHOT_REVISION='2a00e87e9976dc3ed5533dd18caf4cdbc3a1bcb2'
 
 export GENET_DATA_ARTIFACT=processed_data
 export GENET_WAN_VAE_ARTIFACT=wan_vae
@@ -765,7 +770,8 @@ Because the inference directory is node-local, continuously stage `RUN.json`, `R
 moves to another physical node for resume, copy the complete output directory to that node first. Never let multiple
 nodes independently write the same logical run journal.
 
-Generated actions remain offline/simulator outputs until the final dataschema and embodiment-specific safety gates are
+Generated actions remain offline/simulator outputs until the remaining command semantics and embodiment-specific safety gates
+are
 implemented. Do not send them directly to a real robot.
 
 ## 12. Stop/go checklist
@@ -775,7 +781,7 @@ Do not start paid production training until every item is true:
 - [ ] hostfile contains exactly the intended physical nodes in deterministic rank order;
 - [ ] every node exposes eight GPUs, contains the prewarmed RoboTwin cache, and has enough free space under `/mnt/nvme`;
 - [ ] every node pulled the same OCI digest and the embedded GenET revision matches;
-- [ ] the raw RoboTwin manifest was generated by the approved dataschema adapter;
+- [ ] the direct RoboTwin MDS adapter validated the approved schema and recorded the declared index FPS;
 - [ ] canonical preprocessing and `genet-validate-data --cosmos` passed;
 - [ ] every node verified the same cluster lock and created its own receipt;
 - [ ] the receipt binds the actual manifest, Wan VAE, HF cache, and exact load DCP paths;

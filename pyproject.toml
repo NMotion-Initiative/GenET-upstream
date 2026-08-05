@@ -20,6 +20,10 @@ preprocess = [
   "av>=12",
   "pillow>=10",
 ]
+robotwin = [
+  "mosaicml-streaming==0.13.0",
+  "pillow>=10",
+]
 cosmos = [
   "cosmos-framework @ git+https://github.com/NVIDIA/cosmos-framework.git@a904d2d36b774a51dd06ff9ff906816b1a04f579",
 ]
@@ -31,12 +35,14 @@ dev = [
 
 [project.scripts]
 genet-preprocess = "genet.cli.preprocess:main"
+genet-preprocess-robotwin = "genet.cli.preprocess_robotwin:main"
 genet-train = "genet.cli.train:main"
 genet-validate-data = "genet.cli.validate_data:main"
 genet-checkpoint = "genet.cli.checkpoint:main"
 genet-generate-long = "genet.cli.generate_long:main"
 genet-cluster-lock = "genet.cli.cluster_lock:main"
 genet-cluster-preflight = "genet.cli.cluster_preflight:main"
+genet-stage-artifacts = "genet.cli.stage_artifacts:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

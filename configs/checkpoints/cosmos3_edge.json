@@ -1,0 +1,15 @@
+{
+  "cosmos3_edge": {
+    "repo_id": "nvidia/Cosmos3-Edge",
+    "revision": "2a00e87e9976dc3ed5533dd18caf4cdbc3a1bcb2"
+  },
+  "cosmos_framework_revision": "a904d2d36b774a51dd06ff9ff906816b1a04f579",
+  "format_version": "genet.model-artifacts/v1",
+  "wan_vae": {
+    "filename": "Wan2.2_VAE.pth",
+    "repo_id": "Wan-AI/Wan2.2-TI2V-5B",
+    "revision": "921dbaf3f1674a56f47e83fb80a34bac8a8f203e",
+    "sha256": "20eb789667fa5e60e7516bf509512f6cb61f01b0aa0695eadaea930c13892b36",
+    "size": 2818839170
+  }
+}

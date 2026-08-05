@@ -12,7 +12,7 @@
 - Cosmos3-Edge 适配器位于 [`src/genet/models/cosmos_adapter.py`](../src/genet/models/cosmos_adapter.py)，生产 experiment builder 位于 [`src/genet/training/cosmos.py`](../src/genet/training/cosmos.py)。builder 从固定上游版本的 `vision_sft_edge` recipe 构建配置，复用 Cosmos 的 VAE 编码、rectified-flow noising/loss、FSDP、EMA 和 DCP，只替换 GenET 数据与 Source/Reference 条件路径。
 - 当前 Cosmos 适配器要求每个 rank 一个 packed sample、two-way attention、`context_parallel_shard_degree=1`，且 `video_temporal_causal=false`。不要把 CP 改为 2 后期待当前代码可以运行。
 - Source Control 和 reference projection 的轻量可测试实现分别位于 [`src/genet/models/control.py`](../src/genet/models/control.py) 与 [`src/genet/models/reference_attention.py`](../src/genet/models/reference_attention.py)。
-- 数据预处理和 dataloader 是可运行的基础实现，但 action 维度语义、旋转插值、不同本体时间对齐映射仍需在正式 dataschema 到位后完善。当前 `linear`/`nearest` 只能作为通用基线。
+- RoboTwin-v1 的固定 MDS schema、计数、episode、配对与 reference 规则已经实现并硬校验；源数据未提供的 action 单位/坐标系、旋转语义、物理时间戳与不同本体阶段重定时仍需作为显式模型契约补充。当前 release 固定使用 16→16 Hz，不做 action 插值。
 - [`src/genet/training/checkpoint.py`](../src/genet/training/checkpoint.py) 同时包含 standalone checkpoint 和无共享文件系统下的 DCP 汇总工具。两者格式不同，不可混用。
 
 ## 2. 依赖、上游代码与权重
@@ -37,7 +37,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install 'huggingface_hub[cli]'
-python -m pip install -e '.[preprocess,dev]'
+python -m pip install -e '.[preprocess,robotwin,dev]'
 ```
 
 `pyproject.toml` 中的核心依赖只有 `torch`、`numpy` 和 `pyyaml`；视频预处理额外使用 PyAV 和 Pillow。
@@ -62,56 +62,56 @@ python -m pip install -e .
 
 第三方代码、权重许可证及固定版本说明见 [`THIRD_PARTY.md`](../THIRD_PARTY.md)。GenET 自身为 Apache-2.0；Cosmos Framework/Cosmos3 权重受 OpenMDW-1.1 约束，Wan2.2 VAE 以其模型卡条款为准。
 
-### 2.3 下载 Cosmos3-Edge 与 Wan2.2 VAE
+### 2.3 Stage Cosmos3-Edge and the Wan2.2 VAE
 
-先接受对应模型条款并登录 Hugging Face：
-
-```bash
-hf auth login
-```
-
-将模型和 VAE 下载到每个节点的本地 checkpoint 盘，或先下载一次再复制到四个节点：
+Both reviewed repositories are public at the pinned revisions. If access policy later requires authentication, inject
+an ephemeral `HF_TOKEN` only into the short-lived staging container; never run `hf auth login` after `HF_HOME` has been
+set to the cache that will be copied to the training nodes, and never inject the token into training:
 
 ```bash
-export COSMOS3_EDGE_HF_REVISION=REPLACE_WITH_MODEL_REPOSITORY_COMMIT
-export WAN22_HF_REVISION=REPLACE_WITH_MODEL_REPOSITORY_COMMIT
-
-hf download nvidia/Cosmos3-Edge \
-  --revision "${COSMOS3_EDGE_HF_REVISION}" \
-  --local-dir checkpoints/Cosmos3-Edge-hf
-
-hf download Wan-AI/Wan2.2-TI2V-5B Wan2.2_VAE.pth \
-  --revision "${WAN22_HF_REVISION}" \
-  --local-dir checkpoints/wan22_vae
+export HF_TOKEN='<short-lived-read-token>'
+bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet
+unset HF_TOKEN
 ```
 
-上游 Cosmos 训练使用 PyTorch Distributed Checkpoint（DCP）。按照 Cosmos Framework 的转换入口生成基础 DCP：
+The reviewed identities and official locations are committed in
+[`configs/checkpoints/cosmos3_edge.json`](../configs/checkpoints/cosmos3_edge.json):
+
+- `nvidia/Cosmos3-Edge` at `2a00e87e9976dc3ed5533dd18caf4cdbc3a1bcb2`;
+- `Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth` at
+  `921dbaf3f1674a56f47e83fb80a34bac8a8f203e`;
+- Wan VAE SHA-256 `20eb789667fa5e60e7516bf509512f6cb61f01b0aa0695eadaea930c13892b36` and byte count
+  `2818839170`.
+
+Run the staging script inside the immutable GenET Cosmos image on one canonical node:
 
 ```bash
-python -m cosmos_framework.scripts.convert_model_to_dcp \
-  -o checkpoints/Cosmos3-Edge \
-  --checkpoint-path Cosmos3-Edge
+bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet
 ```
 
-如果上游版本要求以本地 HF snapshot 作为输入，应以该固定 commit 的 `--help` 和官方训练文档为准。无论使用 catalog 名还是本地 snapshot，最终四个节点上的基础 DCP 与 `Wan2.2_VAE.pth` 必须具有相同校验和。
-
-建议在提交作业前记录：
+It downloads the complete exact HF snapshot, verifies all mandatory model files and every weight-index shard, writes the
+offline `refs/main`, downloads and verifies the VAE, passes the exact local snapshot into the pinned Cosmos converter,
+validates `model/.metadata`, writes a recursive SHA-256 manifest for the complete DCP, and writes
+`/mnt/nvme/genet/artifacts/ARTIFACTS.json`. The resulting training load path is
+`/mnt/nvme/genet/checkpoints/Cosmos3-Edge`, not its `model/` child. Verify later without networking:
 
 ```bash
-git rev-parse HEAD
-git -C third_party/cosmos-framework rev-parse HEAD
-sha256sum checkpoints/wan22_vae/Wan2.2_VAE.pth
+bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet --verify-only
 ```
 
-每个生产训练进程还必须能解析 Wan VAE 路径。建议在四个节点的 scheduler prologue 中设置同一个节点本地路径：
+Copy the completed HF cache, Wan artifact, `ARTIFACTS.json`, and converted DCP byte-for-byte to the other nodes. Run
+`--verify-only` and then verify the release through the cluster lock on each node. The production environment uses:
 
 ```bash
-export WAN_VAE_PATH=/local_nvme/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth
+export HF_HOME=/mnt/nvme/genet/hf-cache
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export GENET_HF_SNAPSHOT_REVISION=2a00e87e9976dc3ed5533dd18caf4cdbc3a1bcb2
+export WAN_VAE_PATH=/mnt/nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth
 ```
 
-生产 builder 会用该变量覆盖上游 tokenizer 的 `vae_path`。基础 DCP 可以通过命令行 `--warm-start` 传入；如果未传，builder 会读取 `BASE_CHECKPOINT_PATH`。
-
-processed manifest 的 caption 会在 production Dataset 中通过 Edge 官方 `model.config.vlm_config.tokenizer` 转成 `text_token_ids`。因此每个节点还必须能从本地 Hugging Face cache 解析 `nvidia/Cosmos3-Edge` processor；离线集群应在提交前预热并复制同一 `HF_HOME` cache，不能等 worker 启动后访问公网。
+No separate full Wan DiT, Reasoner, DROID policy, ControlNet, reference encoder, or action head checkpoint is required.
+The new GenET branches initialize during S1; S2/S3 load the selected previous-stage GenET DCP.
 
 ### 2.4 无共享存储的环境与内容锁
 
@@ -126,7 +126,7 @@ README 使用 `git archive HEAD` 加入 `GENET_BUILD_REVISION`，不能用 dirty
 genet-cluster-lock create \
   --output /staging/genet-release/cluster-lock.json \
   --artifact processed_data=/staging/genet/data/processed/train \
-  --artifact wan_vae=/staging/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth \
+  --artifact wan_vae=/staging/genet/artifacts/wan22_vae/Wan2.2_VAE.pth \
   --artifact training_checkpoint=/staging/genet/checkpoints/stage2_shared_committed \
   --artifact normalization=/staging/genet/data/normalization \
   --artifact hf_cache=/staging/genet/hf-cache
@@ -139,14 +139,14 @@ genet-cluster-lock verify \
   --lock /local_nvme/genet/release/cluster-lock.json \
   --receipt /local_nvme/genet/release/node-receipt.json \
   --artifact processed_data=/local_nvme/genet/data/processed/train \
-  --artifact wan_vae=/local_nvme/genet/checkpoints/wan22_vae/Wan2.2_VAE.pth \
+  --artifact wan_vae=/local_nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth \
   --artifact training_checkpoint=/local_nvme/genet/checkpoints/stage2_shared_committed \
   --artifact normalization=/local_nvme/genet/data/normalization \
   --artifact hf_cache=/local_nvme/genet/hf-cache
 ```
 
 `training_checkpoint` 必须是本作业实际通过 `--warm-start`、`--resume` 或 `BASE_CHECKPOINT_PATH` 加载的 DCP；
-S1、S2/S3 和 resume 作业应分别替换成各自真实路径。临时 dataschema 还没有 normalization 文件时，
+S1、S2/S3 和 resume 作业应分别替换成各自真实路径。当前 release 尚未生成批准的 normalization 文件时，
 create/verify 两边同时删掉该逻辑项。lock 会扫描目录中的每个
 regular file；HF cache 使用的内部 symlink 会按 root-relative target 记录，broken link 或逃逸 artifact root 的
 link 会被拒绝。这一步可能较慢，但只在 staging/deployment 阶段执行，不在每个训练 step 执行。
@@ -190,29 +190,31 @@ T = 1 + N × temporal_compression_factor
 
 因此默认值 81 合法。`genet.processed-pair/v1` 明确定义 Source、Target 和 Reference 使用同一个固定 T；[`configs/base.yaml`](../configs/base.yaml) 中 `num_frames` 与 `reference_num_frames` 均为 81，配置校验也要求二者相等。`genet-validate-data` 会进一步检查三路视频和 action shape 一致。
 
-一个与训练默认形状一致的预处理命令如下：
+在生产镜像中，一个与训练默认形状一致的预处理命令如下（本地开发 venv 可去掉绝对路径前缀）：
 
 ```bash
-genet-preprocess \
-  --manifest data/raw/train.jsonl \
-  --output data/processed/train \
-  --config configs/schema.example.json \
+/opt/genet-preprocess-venv/bin/python -m genet.cli.preprocess_robotwin \
+  --root /mnt/nvme/mds-cache/robotwin_v1 \
+  --schema configs/data/robotwin_v1.json \
+  --split train \
+  --mds-index-fps 16 \
+  --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train \
   --num-frames 81 \
   --sample-fps 16 \
   --height 192 \
   --width 320 \
   --action-dim 64 \
-  --short-policy drop \
   --action-resample linear
 ```
 
-预处理输出的 manifest 为 `data/processed/train/manifest.jsonl`，这也是 [`configs/base.yaml`](../configs/base.yaml) 的默认 `data.manifest`。节点本地布局不同时，用 `--manifest` 显式覆盖。
+预处理输出的 manifest 为 `/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl`。用
+`--manifest` 显式传入该节点本地路径。
 
 在所有节点上验证本地副本：
 
 ```bash
 genet-validate-data \
-  --manifest data/processed/train/manifest.jsonl \
+  --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl \
   --num-frames 81 \
   --height 192 \
   --width 320 \

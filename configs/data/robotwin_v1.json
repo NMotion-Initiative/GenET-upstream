@@ -1,0 +1,49 @@
+{
+  "action_dims": {
+    "ARX-X5": 14,
+    "aloha-agilex": 14,
+    "franka-panda": 16,
+    "piper": 14,
+    "ur5-wsg": 14
+  },
+  "cameras": [
+    "head",
+    "left",
+    "right"
+  ],
+  "columns": {
+    "action_window": "ndarray:float32",
+    "embodiment": "str",
+    "endpose": "ndarray:float32",
+    "episode_idx": "int",
+    "episode_len": "int",
+    "head_rgb": "bytes",
+    "left_rgb": "bytes",
+    "right_rgb": "bytes",
+    "state": "ndarray:float32",
+    "t": "int",
+    "task": "str"
+  },
+  "dataset": "robotwin_v1",
+  "default_local_root": "/mnt/nvme/mds-cache/robotwin_v1",
+  "expected_counts": {
+    "train": {
+      "ARX-X5": {"episodes": 2086, "samples": 264725, "tasks": 22},
+      "aloha-agilex": {"episodes": 2090, "samples": 382736, "tasks": 22},
+      "franka-panda": {"episodes": 2090, "samples": 248442, "tasks": 22},
+      "piper": {"episodes": 2090, "samples": 270124, "tasks": 22},
+      "ur5-wsg": {"episodes": 2090, "samples": 250615, "tasks": 22}
+    },
+    "val": {
+      "ARX-X5": {"episodes": 110, "samples": 13991, "tasks": 22},
+      "aloha-agilex": {"episodes": 110, "samples": 20333, "tasks": 22},
+      "franka-panda": {"episodes": 110, "samples": 13132, "tasks": 22},
+      "piper": {"episodes": 110, "samples": 14151, "tasks": 22},
+      "ur5-wsg": {"episodes": 110, "samples": 13247, "tasks": 22}
+    }
+  },
+  "observed_schema_sha256": "e97af74a65748aff2b16ee0d9bd5fd7f2299af14f04a083ea2fef0f1cf435446",
+  "schema_version": 1,
+  "streaming_version": "0.13.0",
+  "window_size": 100
+}

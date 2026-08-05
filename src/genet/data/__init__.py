@@ -9,6 +9,14 @@ from .preprocess import (
     preprocess_manifest,
 )
 from .reference import NoReferenceCandidateError, StatelessReferencePool, stable_index
+from .robotwin import (
+    ROBOTWIN_ADAPTER_VERSION,
+    RoboTwinContract,
+    RoboTwinPreprocessConfig,
+    load_robotwin_contract,
+    preprocess_robotwin_mds,
+    validate_robotwin_root,
+)
 from .sampling import ShortSequenceError, make_time_grid
 from .schema import (
     RAW_PAIR_JSON_SCHEMA,
@@ -32,6 +40,9 @@ __all__ = [
     "PreprocessReport",
     "ProcessedPairDataset",
     "RAW_PAIR_JSON_SCHEMA",
+    "ROBOTWIN_ADAPTER_VERSION",
+    "RoboTwinContract",
+    "RoboTwinPreprocessConfig",
     "SCHEMA_VERSION",
     "SchemaError",
     "ShortSequenceError",
@@ -41,11 +52,14 @@ __all__ = [
     "decode_video",
     "iter_raw_manifest",
     "load_action_series",
+    "load_robotwin_contract",
     "make_time_grid",
     "pair_collate_fn",
     "preprocess_manifest",
+    "preprocess_robotwin_mds",
     "read_raw_manifest",
     "resample_actions",
     "resize_center_crop",
     "stable_index",
+    "validate_robotwin_root",
 ]

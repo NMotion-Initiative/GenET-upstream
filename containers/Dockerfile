@@ -13,6 +13,9 @@ ARG GENET_CODE_REVISION
 ARG COSMOS_REVISION=a904d2d36b774a51dd06ff9ff906816b1a04f579
 ARG COSMOS_DEPENDENCY_GROUP=cu130-train
 ARG UV_VERSION=0.11.28
+# Streaming 0.13.0 needs NumPy <2.2 while the Cosmos lock uses 2.2.6.
+# The clone is created in the same layer as uv sync to avoid OverlayFS copy-up.
+ARG ROBOTWIN_VENV=/opt/genet-preprocess-venv
 
 LABEL org.opencontainers.image.title="GenET Cosmos3-Edge training"
 LABEL org.opencontainers.image.revision="${GENET_CODE_REVISION}"
@@ -62,7 +65,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=tmpfs,target=/tmp \
     uv sync --frozen --all-extras --group="${COSMOS_DEPENDENCY_GROUP}" \
     && .venv/bin/python -c \
-        'import os, torch; group=os.environ["GENET_COSMOS_DEPENDENCY_GROUP"]; expected="13." if group == "cu130-train" else "12.8"; actual=torch.version.cuda or ""; assert actual.startswith(expected), f"{group} resolved CUDA {actual}, expected {expected}"'
+        'import numpy, os, torch; group=os.environ["GENET_COSMOS_DEPENDENCY_GROUP"]; expected="13." if group == "cu130-train" else "12.8"; actual=torch.version.cuda or ""; assert actual.startswith(expected), f"{group} resolved CUDA {actual}, expected {expected}"; assert numpy.__version__ == "2.2.6", numpy.__version__' \
+    && uv pip freeze --python .venv/bin/python \
+        | LC_ALL=C sort > /tmp/genet-training-before.txt \
+    && cp -al .venv "${ROBOTWIN_VENV}" \
+    && uv pip install \
+        --python "${ROBOTWIN_VENV}/bin/python" \
+        'mosaicml-streaming==0.13.0' \
+    && uv pip check --python "${ROBOTWIN_VENV}/bin/python" \
+    && "${ROBOTWIN_VENV}/bin/python" -c \
+        'import importlib.metadata as m; import numpy, streaming, torch; assert m.version("mosaicml-streaming") == "0.13.0"; assert tuple(map(int, numpy.__version__.split(".")[:2])) < (2, 2); print(torch.__version__, numpy.__version__)' \
+    && uv pip freeze --python .venv/bin/python \
+        | LC_ALL=C sort > /tmp/genet-training-after.txt \
+    && cmp /tmp/genet-training-before.txt /tmp/genet-training-after.txt
 
 ENV VIRTUAL_ENV=/opt/cosmos-framework/.venv \
     PATH="/opt/cosmos-framework/.venv/bin:${PATH}" \
@@ -75,10 +90,22 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     test "$(cat "${GENET_BUILD_REVISION_FILE}")" = "${GENET_CODE_REVISION}" \
     && uv pip install \
         --python "${VIRTUAL_ENV}/bin/python" \
-        --no-deps \
         --no-build-isolation \
+        --no-deps \
         . \
+    && uv pip install \
+        --python "${ROBOTWIN_VENV}/bin/python" \
+        --no-build-isolation \
+        --no-deps \
+        . \
+    && uv pip check --python "${ROBOTWIN_VENV}/bin/python" \
     && uv pip freeze --python "${VIRTUAL_ENV}/bin/python" \
         | LC_ALL=C sort > /opt/GENET_PIP_FREEZE.txt \
     && sha256sum /opt/GENET_PIP_FREEZE.txt > /opt/GENET_PIP_FREEZE.sha256 \
-    && python -c 'import av, PIL, torch, cosmos_framework, genet; print(torch.__version__, torch.version.cuda)'
+    && uv pip freeze --python "${ROBOTWIN_VENV}/bin/python" \
+        | LC_ALL=C sort > /opt/GENET_PREPROCESS_PIP_FREEZE.txt \
+    && sha256sum /opt/GENET_PREPROCESS_PIP_FREEZE.txt \
+        > /opt/GENET_PREPROCESS_PIP_FREEZE.sha256 \
+    && python -c 'import av, numpy, PIL, torch, cosmos_framework, genet; assert numpy.__version__ == "2.2.6"; print(torch.__version__, torch.version.cuda)' \
+    && "${ROBOTWIN_VENV}/bin/python" -c \
+        'import importlib.metadata as m; import av, genet, numpy, PIL, streaming, torch; assert m.version("mosaicml-streaming") == "0.13.0"; assert tuple(map(int, numpy.__version__.split(".")[:2])) < (2, 2); print(torch.__version__, numpy.__version__, PIL.__version__)'

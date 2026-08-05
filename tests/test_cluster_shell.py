@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import subprocess
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = (
@@ -14,6 +13,7 @@ SCRIPTS = (
     "preflight_roce.sh",
     "pull_hyperbolic_image.sh",
     "run_hyperbolic_container.sh",
+    "stage_model_artifacts.sh",
 )
 IMAGE_REF = "registry.example/genet@sha256:" + "a" * 64
 
@@ -81,6 +81,15 @@ def test_hyperbolic_shell_scripts_parse() -> None:
             ["bash", "-n", str(ROOT / "scripts" / script_name)],
             check=True,
         )
+
+
+def test_docker_keeps_robotwin_out_of_the_frozen_training_environment() -> None:
+    dockerfile = (ROOT / "containers" / "Dockerfile").read_text(encoding="utf-8")
+    assert '--python "${VIRTUAL_ENV}/bin/python"' in dockerfile
+    assert "--no-deps" in dockerfile
+    assert 'cp -al .venv "${ROBOTWIN_VENV}"' in dockerfile
+    assert "'mosaicml-streaming==0.13.0'" in dockerfile
+    assert "cmp /tmp/genet-training-before.txt /tmp/genet-training-after.txt" in dockerfile
 
 
 def test_container_runner_accepts_inherited_environment(tmp_path: Path) -> None:
