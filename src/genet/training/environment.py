@@ -10,9 +10,10 @@ import os
 import platform
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 
@@ -25,9 +26,11 @@ _SHA256_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _DISTRIBUTED_ENV_KEYS = {
     "GLOO_SOCKET_IFNAME",
+    "GENET_ARTIFACT_RECEIPT_ARTIFACT",
     "GENET_CHECKPOINT_ARTIFACT",
     "GENET_DATA_ARTIFACT",
     "GENET_HF_ARTIFACT",
+    "GENET_PROTECT_INPUTS",
     "GENET_WAN_VAE_ARTIFACT",
     "HF_HUB_OFFLINE",
     "NCCL_ALGO",

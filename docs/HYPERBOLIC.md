@@ -80,6 +80,32 @@ export GENET_MANIFEST="${GENET_PROCESSED_DATA}/manifest.jsonl"
 
 ## 3. Prepare the four hosts
 
+### 3.1 Control-node checkout and SSH
+
+The machine that builds the image and runs the SSH coordinator needs one clean GenET checkout. The other three workers
+do not: the image contains `/opt/genet`, and the coordinator streams the small host helpers over SSH. On the selected
+control node:
+
+```bash
+git clone https://github.com/ACondaway/GenET.git
+cd GenET
+git pull --ff-only origin main
+
+export GENET_REVISION="$(git rev-parse HEAD)"
+test "$(printf '%s' "${GENET_REVISION}" | wc -c)" -eq 40
+test -z "$(git status --porcelain)"
+
+install -d -m 0700 /secure/path
+cp configs/cluster/hyperbolic_4x8.hosts.example \
+  /secure/path/genet-hosts.txt
+chmod 0600 /secure/path/genet-hosts.txt
+# Edit this file now with local/rank1/rank2/rank3 SSH aliases in rank order.
+```
+
+Build and launch only committed bytes. For a reviewed release, replace `main` with its exact 40-character commit and
+use `git checkout --detach <commit>`. The worker environment is defined by the OCI digest, not by four independent Git
+checkouts or `pip install` runs.
+
 Hyperbolic exposes SSH connection details for each allocated node. Put the corresponding SSH targets in a local
 hostfile in deterministic rank order. Use SSH aliases when ports, users, or identity files differ; keep credentials out
 of Git. The launcher accepts a parameterized hostfile, so this guide does not invent public IPs or hostnames.
@@ -97,13 +123,87 @@ while IFS= read -r GENET_SSH_TARGET; do
 done < /secure/path/genet-hosts.txt
 ```
 
-On every GPU node, run the versioned host check first:
+### 3.2 One-time Ubuntu host packages
+
+Hyperbolic images often already include the NVIDIA driver, Docker, and the NVIDIA container runtime. Inspect first; do
+not reinstall a working cloud driver. If `nvidia-smi` is missing or the provisioned driver does not expose all eight
+GPUs, stop and ask Hyperbolic support rather than installing an arbitrary driver into the running allocation.
+
+For a missing Docker Engine on an Ubuntu node, install it from Docker's official apt repository. Run directly as root,
+or add `sudo` as a normal administrator:
 
 ```bash
-GENET_NODE_CACHE=/mnt/nvme/mds-cache/robotwin_v1 \
-GENET_NVME_ROOT=/mnt/nvme \
-GENET_EXPECTED_GPUS=8 \
-bash scripts/check_hyperbolic_host.sh
+apt-get update
+apt-get install -y ca-certificates curl gnupg git openssh-client rsync \
+  iproute2 util-linux rdma-core infiniband-diags ibverbs-utils perftest
+
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+
+. /etc/os-release
+cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+```
+
+Then install/configure the NVIDIA Container Toolkit only when `nvidia-ctk` or the Docker NVIDIA runtime is missing:
+
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+apt-get update
+apt-get install -y nvidia-container-toolkit
+nvidia-ctk runtime configure --runtime=docker
+systemctl restart docker
+
+docker run --rm --runtime=nvidia --gpus all ubuntu:24.04 nvidia-smi
+```
+
+These commands follow the current [Docker Ubuntu installation guide](https://docs.docker.com/engine/install/ubuntu/)
+and [NVIDIA Container Toolkit guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
+including NVIDIA's [sample GPU workload](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/sample-workload.html).
+The host does not need Miniconda, a Python environment, or a CUDA toolkit. A non-root coordinator account needs Docker
+daemon access; use the administrator-approved Docker group or rootless policy and log in again before continuing.
+
+One OCI digest makes the container user space identical; it does not freeze the host kernel, NVIDIA driver, OFED/RDMA
+stack, NIC firmware, GID table, MTU, or switch QoS. The Gloo hardware signature compares GPU/driver identity, while the
+32-rank NCCL preflight and provider benchmark validate the live fabric. Keep all three gates.
+
+### 3.3 Validate every allocated node
+
+From the control-node checkout, stream the versioned host check to every worker; no worker checkout is required:
+
+```bash
+while IFS= read -r GENET_SSH_TARGET; do
+  case "${GENET_SSH_TARGET}" in ''|'#'*) continue ;; esac
+  if [[ "${GENET_SSH_TARGET}" == local ]]; then
+    env \
+      GENET_NODE_CACHE=/mnt/nvme/mds-cache/robotwin_v1 \
+      GENET_NVME_ROOT=/mnt/nvme \
+      GENET_EXPECTED_GPUS=8 \
+      bash scripts/check_hyperbolic_host.sh
+  else
+    ssh "${GENET_SSH_TARGET}" \
+      'env GENET_NODE_CACHE=/mnt/nvme/mds-cache/robotwin_v1 \
+        GENET_NVME_ROOT=/mnt/nvme GENET_EXPECTED_GPUS=8 bash -s' \
+      < scripts/check_hyperbolic_host.sh
+  fi
+done < /secure/path/genet-hosts.txt
 ```
 
 Its inventory verifies the NVMe mount, the prewarmed cache, eight GPUs, Docker access, the NVIDIA runtime, RDMA character
@@ -126,15 +226,15 @@ reachable bootstrap and RDMA networks. Hyperbolic allocations can expose differe
 reservation details and command output. Do not copy `NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, `NCCL_IB_HCA`, a GID
 index, IP address, MTU, traffic class, or service level from this guide.
 
-The four nodes must be able to reach rank 0's chosen `MASTER_ADDR` on both the training and preflight ports. Public SSH
-addresses and the private cluster bootstrap address are separate concepts. Validate the actual RDMA path with a
-multi-node `nccl-tests` run; the CPU/Gloo preflight does not replace it.
+The four nodes must be able to reach rank 0's chosen `MASTER_ADDR` on the training, Gloo-preflight, and NCCL-preflight
+ports. Public SSH addresses and the private cluster bootstrap address are separate concepts. Validate the actual RDMA
+path with both the built-in 32-rank collective and a provider-baselined multi-node `nccl-tests` run; the CPU/Gloo
+preflight does not replace them.
 
-If Docker or the NVIDIA container runtime is missing, install it once from NVIDIA's and Docker's current official
-instructions, then verify the intended base image with `docker run --rm --gpus all ... nvidia-smi`. Host Miniconda,
-Python, a host CUDA toolkit, and a host source checkout are not part of the training environment: Python, the uv-managed
-environment, CUDA user-space libraries, Cosmos, GenET, configs, and launch scripts live in the immutable image. The host
-needs only the NVIDIA driver, NVIDIA container runtime, Docker, SSH/rsync, RDMA devices, and enough local storage.
+Host Miniconda, Python, and a host CUDA toolkit are not part of the training environment: Python, the uv-managed
+environment, CUDA user-space libraries, Cosmos, GenET, configs, and launch scripts live in the immutable image. Only the
+control node needs the source checkout described in Section 3.1. Each GPU host needs the NVIDIA driver, NVIDIA container
+runtime, Docker, SSH/rsync, RDMA devices, and enough local storage.
 
 Verify Docker's persistent storage before building a multi-gigabyte image:
 
@@ -159,14 +259,36 @@ Build on one trusted release host from a committed tree with the versioned helpe
 under `/dev/shm`; Docker/BuildKit layers still use the daemon's configured storage root, which the helper prints:
 
 ```bash
-export GENET_REVISION="$(git rev-parse HEAD)"
-export BASE_IMAGE_TAG='nvcr.io/nvidia/pytorch:26.06-py3'
-docker pull "${BASE_IMAGE_TAG}"
-export BASE_IMAGE="$(docker image inspect --format '{{index .RepoDigests 0}}' "${BASE_IMAGE_TAG}")"
+export REGISTRY_HOST='<registry-host>'
+export REGISTRY_USER='<registry-user>'
+export GENET_IMAGE_REPO="${REGISTRY_HOST}/<namespace>/genet"
+
+# Example for this repository's owner, if GHCR package permissions are enabled:
+# export REGISTRY_HOST=ghcr.io
+# export REGISTRY_USER=ACondaway
+# export GENET_IMAGE_REPO=ghcr.io/acondaway/genet
+
+# Use a short-lived registry credential. Repeat docker login on every worker.
+# The build identity needs push permission; worker identities need pull permission.
+read -r -s -p 'Registry token: ' GENET_REGISTRY_TOKEN
+printf '\n'
+printf '%s' "${GENET_REGISTRY_TOKEN}" \
+  | docker login "${REGISTRY_HOST}" --username "${REGISTRY_USER}" --password-stdin
+unset GENET_REGISTRY_TOKEN
+
+export BASE_IMAGE_REPO='nvcr.io/nvidia/pytorch'
+export BASE_IMAGE_TAG="${BASE_IMAGE_REPO}:26.06-py3"
+export BASE_IMAGE_DIGEST="$(
+  docker buildx imagetools inspect "${BASE_IMAGE_TAG}" \
+    --format '{{.Manifest.Digest}}'
+)"
+export BASE_IMAGE="${BASE_IMAGE_REPO}@${BASE_IMAGE_DIGEST}"
 [[ "${BASE_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]
+docker pull "${BASE_IMAGE}"
 docker run --rm --gpus all "${BASE_IMAGE}" nvidia-smi
 
-export GENET_IMAGE_TAG='registry.example/genet:'"${GENET_REVISION}"
+export GENET_REVISION="$(git rev-parse HEAD)"
+export GENET_IMAGE_TAG="${GENET_IMAGE_REPO}:${GENET_REVISION}"
 export GENET_BUILD_CONTEXT_ROOT=/dev/shm
 export COSMOS_DEPENDENCY_GROUP=cu130-train
 
@@ -180,9 +302,40 @@ docker image inspect --format 'bytes={{.Size}}' "${GENET_IMAGE_TAG}"
 docker history "${GENET_IMAGE_TAG}"
 
 docker push "${GENET_IMAGE_TAG}"
-export GENET_IMAGE_REF="$(docker image inspect --format '{{index .RepoDigests 0}}' "${GENET_IMAGE_TAG}")"
+export GENET_IMAGE_DIGEST="$(
+  docker buildx imagetools inspect "${GENET_IMAGE_TAG}" \
+    --format '{{.Manifest.Digest}}'
+)"
+export GENET_IMAGE_REF="${GENET_IMAGE_REPO}@${GENET_IMAGE_DIGEST}"
 [[ "${GENET_IMAGE_REF}" =~ @sha256:[0-9a-f]{64}$ ]]
+docker pull "${GENET_IMAGE_REF}"
 ```
+
+Authenticate every worker before asking the launcher to pull the private image. This sends the short-lived token only
+over SSH standard input; it is never placed in `s1.env`, a remote argv, or a file:
+
+```bash
+read -r -s -p 'Registry pull token: ' GENET_REGISTRY_PULL_TOKEN
+printf '\n'
+while IFS= read -r GENET_SSH_TARGET; do
+  case "${GENET_SSH_TARGET}" in ''|'#'*) continue ;; esac
+  if [[ "${GENET_SSH_TARGET}" == local ]]; then
+    printf '%s' "${GENET_REGISTRY_PULL_TOKEN}" \
+      | docker login "${REGISTRY_HOST}" \
+          --username "${REGISTRY_USER}" --password-stdin
+  else
+    printf '%s' "${GENET_REGISTRY_PULL_TOKEN}" \
+      | ssh "${GENET_SSH_TARGET}" \
+          docker login "${REGISTRY_HOST}" \
+            --username "${REGISTRY_USER}" --password-stdin
+  fi
+done < /secure/path/genet-hosts.txt
+unset GENET_REGISTRY_PULL_TOKEN
+```
+
+Use a pull-only credential on workers when the registry supports separate permissions. The coordinated launcher later
+pulls `GENET_IMAGE_REF` concurrently and checks that the local manifest digest is the requested digest before starting
+any rendezvous.
 
 The helper refuses dirty tracked source, builds from `git archive HEAD`, embeds the full Git revision, and requires the
 base image to be pinned by digest. Untracked files are never included. Use `cu130-train` with the CUDA 13 / NGC PyTorch
@@ -194,15 +347,16 @@ The example selects the pinned digest corresponding to the official Cosmos-recom
 Record the digest printed by the registry and use the resolved `GENET_IMAGE_REF` as the only production reference:
 
 ```bash
-export GENET_IMAGE_REF='registry.example/genet@sha256:<pushed-image-digest>'
+: "${GENET_IMAGE_REF:?Keep the digest-pinned image reference produced above}"
+[[ "${GENET_IMAGE_REF}" =~ @sha256:[0-9a-f]{64}$ ]]
 ```
 
-Authenticate the four nodes to the registry using the provider's credential mechanism, pull that exact digest, and
-confirm it is available. The SSH launcher can fan out the pull, but it must never convert `GENET_IMAGE_REF` back to a
-tag. The image contains versioned `configs/` and `scripts/` under `/opt/genet`, the installed GenET wheel, the pinned
-Cosmos checkout, and package inventories for both Python environments. Its default PATH is the frozen Cosmos training
-venv. RoboTwin preprocessing runs from `/opt/genet-preprocess-venv`; this separation prevents Streaming's NumPy
-constraint from changing the Cosmos lock.
+Authenticate all four nodes to the registry using its credential mechanism before the coordinated launch. Do not put a
+registry password in the shared job environment. The SSH launcher fans out the digest pull, but it must never convert
+`GENET_IMAGE_REF` back to a tag. The image contains versioned `configs/` and `scripts/` under `/opt/genet`, the installed
+GenET wheel, the pinned Cosmos checkout, and package inventories for both Python environments. Its default PATH is the
+frozen Cosmos training venv. RoboTwin preprocessing runs from `/opt/genet-preprocess-venv`; this separation prevents
+Streaming's NumPy constraint from changing the Cosmos lock.
 
 ## 5. Prepare RoboTwin v1 once, then replicate the bytes
 
@@ -213,16 +367,21 @@ The repository now consumes the probed RoboTwin-v1 MDS schema directly through
 `{root}/{split}/{embodiment}`, validates every row and episode, and pairs Source/Target only when `split`, `task`, and
 `episode_idx` match.
 
-Copy `configs/cluster/hyperbolic_4x8.env.example` to a private preparation-host file, replace its placeholders, add
-`NODE_RANK=0`, set `GENET_CONTAINER_NAME=genet-preprocess`, and set `GENET_CACHE_READONLY=0`. The cache is writable only
-while the designated preparation node creates the canonical processed tree; restore `GENET_CACHE_READONLY=1` before
-validation locks or training. This write access is also required because MosaicML Streaming can lazily materialize
-compressed `.mds.zstd` shards beside the source shards on first access. Inspect the resolved adapter configuration
-through that same digest-pinned container environment:
+Copy the dedicated one-node template rather than the strict training environment:
+
+```bash
+cp configs/cluster/hyperbolic_prepare.env.example /secure/path/preprocess.host.env
+```
+
+It sets `NODE_RANK=0`, a unique container name, `GENET_CACHE_READONLY=0`, and `GENET_PROTECT_INPUTS=0`. The cache is
+writable only while the designated preparation node creates the canonical processed tree; training later uses a
+read-only mount. This write access is also required because MosaicML Streaming can lazily materialize compressed
+`.mds.zstd` shards beside the source shards on first access. Inspect the resolved adapter configuration through that
+same digest-pinned container environment:
 
 ```bash
 export GENET_PREP_HOST_ENV=/secure/path/preprocess.host.env
-export GENET_IMAGE_REF='registry.example/genet@sha256:<pushed-image-digest>'
+: "${GENET_IMAGE_REF:?Export the digest-pinned image reference produced in Section 4}"
 
 bash scripts/run_hyperbolic_container.sh \
   "${GENET_PREP_HOST_ENV}" \
@@ -248,7 +407,7 @@ environment created in Section 5.1, run the command through the container helper
 
 ```bash
 export GENET_PREP_HOST_ENV=/secure/path/preprocess.host.env
-export GENET_IMAGE_REF='registry.example/genet@sha256:<pushed-image-digest>'
+: "${GENET_IMAGE_REF:?Export the digest-pinned image reference produced in Section 4}"
 
 bash scripts/run_hyperbolic_container.sh \
   "${GENET_PREP_HOST_ENV}" \
@@ -284,6 +443,30 @@ embodiments when both sides cover the full `T=81` window; shorter pairs are coun
 Target embodiment and split but a different task and episode. Production must keep
 `reference_mode=stored`; the generic runtime pool has weaker task-exclusion semantics.
 
+The trainer consumes the locked train manifest. Export `val` separately before releasing the preparation node so the
+fixed validation split is also checked and available for evaluation:
+
+```bash
+bash scripts/run_hyperbolic_container.sh \
+  "${GENET_PREP_HOST_ENV}" \
+  "${GENET_IMAGE_REF}" \
+  /opt/genet-preprocess-venv/bin/python -m genet.cli.preprocess_robotwin \
+    --root /mnt/nvme/mds-cache/robotwin_v1 \
+    --schema /opt/genet/configs/data/robotwin_v1.json \
+    --split val \
+    --mds-index-fps 16 \
+    --output /mnt/nvme/mds-cache/robotwin_v1/genet/processed/val \
+    --num-frames 81 \
+    --sample-fps 16 \
+    --height 192 \
+    --width 320 \
+    --action-dim 64 \
+    --action-resample linear
+```
+
+Add the validation tree to a separate evaluation lock if an evaluation job consumes it; do not silently add it to a
+training release whose lock was already published.
+
 The immutable image build validates `streaming==0.13.0` and Pillow in the isolated preprocessing venv. Do not resolve
 dependencies separately on each node. The raw MDS cache is a staging input and is not part of the training release lock;
 the finished processed tree is the locked training artifact. After a successful full export, restore
@@ -318,6 +501,9 @@ DCP, records a recursive DCP SHA-256 manifest, and writes
 `/mnt/nvme/genet/artifacts/ARTIFACTS.json`:
 
 ```bash
+cp configs/cluster/hyperbolic_artifacts.env.example \
+  /secure/path/download.host.env
+
 bash scripts/run_hyperbolic_container.sh \
   /secure/path/download.host.env \
   "${GENET_IMAGE_REF}" \
@@ -330,9 +516,10 @@ upstream branch and records the result, but it must go through review before bec
 existing `refs/main`, VAE, or DCP is rejected; `--force` is required to replace it, and an old DCP is preserved under a
 timestamped backup name.
 
-The private staging environment must set `NODE_RANK=0`, a unique container name,
+The supplied staging template sets `NODE_RANK=0`, a unique container name,
 `HF_HOME=/mnt/nvme/genet/hf-cache`, and `GENET_ALLOW_HF_TOKEN=1`. Add `HF_TOKEN` only if the account requires one; Docker
-can inspect that environment while the short-lived preparation container exists, so never reuse it for training.
+can inspect that environment while the short-lived preparation container exists, so never reuse it for training and
+unset the token immediately after staging.
 The script writes `refs/main` so the pinned upstream recipe's offline catalog lookup resolves to the reviewed snapshot.
 After staging, record the spec revision in every job environment and use:
 
@@ -364,43 +551,74 @@ root on all four hosts:
 - the exact base/warm-start/resume DCP;
 - `hf-cache`.
 
-Copy into dedicated destinations without deleting unrelated files. A successful copy is not accepted until the
-offline artifact verifier and cluster-lock verification both succeed on that node. Because all Hyperbolic nodes use the
-same `/mnt/nvme/genet` layout, the copied artifact receipt remains valid:
+Before copying, re-run the offline verifier on the canonical node from a fresh token-free template. A successful copy is
+not accepted until the all-node semantic and cluster-lock verification in Section 7 also succeeds:
 
 ```bash
+unset HF_TOKEN HUGGING_FACE_HUB_TOKEN
+cp configs/cluster/hyperbolic_artifacts.env.example \
+  /secure/path/artifact-verify.host.env
+
 bash scripts/run_hyperbolic_container.sh \
-  /secure/path/lock.host.env \
+  /secure/path/artifact-verify.host.env \
   "${GENET_IMAGE_REF}" \
   bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet --verify-only
 ```
 
-When the preparation node is rank 0 and the coordinator, this non-destructive pattern copies the canonical processed
-tree to ranks 1–3. Run analogous `rsync -aH --partial` commands for the model/cache trees listed above; deliberately omit
-`--delete`:
+When the preparation node is rank 0 and the coordinator, the following non-destructive loop copies every S1 input to
+ranks 1–3. It deliberately omits `--delete`; use a new versioned release destination for upgrades instead of mutating a
+previously verified input set:
 
 ```bash
 while IFS= read -r GENET_SSH_TARGET; do
   case "${GENET_SSH_TARGET}" in ''|'#'*|local) continue ;; esac
   ssh "${GENET_SSH_TARGET}" \
-    'mkdir -p /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train'
+    'mkdir -p \
+      /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train \
+      /mnt/nvme/genet/hf-cache \
+      /mnt/nvme/genet/artifacts/wan22_vae \
+      /mnt/nvme/genet/checkpoints/Cosmos3-Edge'
+
   rsync -aH --partial --info=progress2 \
     /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/ \
     "${GENET_SSH_TARGET}:/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/"
+
+  rsync -aH --partial --info=progress2 \
+    /mnt/nvme/genet/hf-cache/ \
+    "${GENET_SSH_TARGET}:/mnt/nvme/genet/hf-cache/"
+
+  rsync -aH --partial --info=progress2 \
+    /mnt/nvme/genet/artifacts/wan22_vae/ \
+    "${GENET_SSH_TARGET}:/mnt/nvme/genet/artifacts/wan22_vae/"
+
+  rsync -aH --partial \
+    /mnt/nvme/genet/artifacts/ARTIFACTS.json \
+    "${GENET_SSH_TARGET}:/mnt/nvme/genet/artifacts/ARTIFACTS.json"
+
+  rsync -aH --partial --info=progress2 \
+    /mnt/nvme/genet/checkpoints/Cosmos3-Edge/ \
+    "${GENET_SSH_TARGET}:/mnt/nvme/genet/checkpoints/Cosmos3-Edge/"
 done < /secure/path/genet-hosts.txt
 ```
+
+Copy `normalization/` in the same way only after that artifact exists and has been added to the lock. Raw RoboTwin MDS
+already exists independently on every node and is not copied by this loop. A later full release verification hashes all
+bytes and rejects missing, stale, or changed files.
 
 ## 6. Create the release lock and node receipts
 
 Create a distinct release directory and lock for each job input set. Run the lock tool through the same immutable image;
-the private host environment used here should set `GENET_CONTAINER_NAME=genet-lock`. The following is an S1 example:
+use the dedicated one-node lock template. The following is an S1 example:
 
 ```bash
 export GENET_NODE_RUN_ROOT=/mnt/nvme/genet
 export GENET_PROCESSED_DATA=/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train
-export GENET_IMAGE_REF='registry.example/genet@sha256:<pushed-image-digest>'
 export GENET_RELEASE_ID="s1-${GENET_REVISION}"
 export GENET_RELEASE_DIR="${GENET_NODE_RUN_ROOT}/release/${GENET_RELEASE_ID}"
+
+cp configs/cluster/hyperbolic_lock.env.example /secure/path/lock.host.env
+sed -i "s/REPLACE_WITH_RELEASE_ID/${GENET_RELEASE_ID}/g" \
+  /secure/path/lock.host.env
 
 bash scripts/run_hyperbolic_container.sh \
   /secure/path/lock.host.env \
@@ -417,29 +635,29 @@ bash scripts/run_hyperbolic_container.sh \
   '
 ```
 
-Add `--artifact normalization="${GENET_NODE_RUN_ROOT}/normalization"` to both lock commands once that artifact exists.
-Copy `cluster-lock.json` to the identical release directory on every node. Then verify locally on every node and create
-that node's receipt:
+Add `--artifact normalization="${GENET_NODE_RUN_ROOT}/normalization"` once that artifact exists. The shared environment
+must then set both `GENET_NORMALIZATION_ARTIFACT=normalization` and its exact `GENET_NORMALIZATION_PATH`.
+
+Do not create or copy a node receipt yet. It must be generated independently from each node's local paths after the
+shared job environment is complete. That environment includes:
 
 ```bash
-bash scripts/run_hyperbolic_container.sh \
-  /secure/path/lock.host.env \
-  "${GENET_IMAGE_REF}" \
-  bash -lc '
-    set -euo pipefail
-    genet-cluster-lock verify \
-      --lock "${GENET_RELEASE_DIR}/cluster-lock.json" \
-      --receipt "${GENET_RELEASE_DIR}/node-receipt.json" \
-      --artifact processed_data="${GENET_PROCESSED_DATA}" \
-      --artifact wan_vae="${GENET_NODE_RUN_ROOT}/artifacts/wan22_vae/Wan2.2_VAE.pth" \
-      --artifact artifact_receipt="${GENET_NODE_RUN_ROOT}/artifacts/ARTIFACTS.json" \
-      --artifact training_checkpoint="${GENET_NODE_RUN_ROOT}/checkpoints/Cosmos3-Edge" \
-      --artifact hf_cache="${GENET_NODE_RUN_ROOT}/hf-cache"
-  '
+export GENET_ARTIFACT_RECEIPT_ARTIFACT=artifact_receipt
+export GENET_ARTIFACT_RECEIPT_PATH=/mnt/nvme/genet/artifacts/ARTIFACTS.json
+export GENET_PROTECT_INPUTS=1
 ```
 
-Do not copy a receipt from another node. It is deliberately regenerated from that node's verified local paths. Keep the
-verified artifact directories read-only for the lifetime of the job.
+After creating the lock on rank 0, copy only that lock file to the identical release directory on ranks 1–3:
+
+```bash
+while IFS= read -r GENET_SSH_TARGET; do
+  case "${GENET_SSH_TARGET}" in ''|'#'*|local) continue ;; esac
+  ssh "${GENET_SSH_TARGET}" "mkdir -p '${GENET_RELEASE_DIR}'"
+  rsync -a --partial \
+    "${GENET_RELEASE_DIR}/cluster-lock.json" \
+    "${GENET_SSH_TARGET}:${GENET_RELEASE_DIR}/cluster-lock.json"
+done < /secure/path/genet-hosts.txt
+```
 
 ## 7. Create the hostfile and environment file
 
@@ -457,12 +675,12 @@ Targets must be unique. Each target is interpreted by the coordinator's SSH conf
 alias; use the literal `local` only when rank 0 is the coordinator itself. Set `MASTER_ADDR` separately to rank 0's
 private address visible from every training node. It is usually not the public SSH address or SSH alias.
 
-Copy the versioned shared environment and hostfile templates to a private job directory on the coordinator host, then
-edit the copies:
+The hostfile was created and filled in Section 3.1. Now copy the shared training environment template to the same private
+job directory and edit every placeholder:
 
 ```bash
 cp configs/cluster/hyperbolic_4x8.env.example /secure/path/s1.env
-cp configs/cluster/hyperbolic_4x8.hosts.example /secure/path/genet-hosts.txt
+chmod 0600 /secure/path/s1.env
 ```
 
 The image reference is a separate required launcher argument so it cannot be hidden or accidentally overridden by the
@@ -478,7 +696,12 @@ export NPROC_PER_NODE=8
 export MASTER_ADDR='<rank-0-private-address>'
 export MASTER_PORT='<unique-training-port>'
 export PREFLIGHT_PORT='<unique-preflight-port>'
+export NCCL_PREFLIGHT_PORT='<third-unique-nccl-preflight-port>'
 export GENET_PREFLIGHT_TIMEOUT_SECONDS=120
+export GENET_NCCL_PREFLIGHT_TIMEOUT_SECONDS=180
+export GENET_NCCL_PREFLIGHT_BUFFER_MIB=64
+export GENET_NCCL_PREFLIGHT_WARMUP_ITERATIONS=3
+export GENET_NCCL_PREFLIGHT_ITERATIONS=10
 
 export GENET_STRICT_ENV=1
 export GENET_CODE_REVISION='<full-40-character-GenET-commit>'
@@ -491,10 +714,12 @@ export GENET_DATA_ARTIFACT=processed_data
 export GENET_WAN_VAE_ARTIFACT=wan_vae
 export GENET_CHECKPOINT_ARTIFACT=training_checkpoint
 export GENET_HF_ARTIFACT=hf_cache
+export GENET_ARTIFACT_RECEIPT_ARTIFACT=artifact_receipt
 export GENET_PROCESSED_DATA=/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train
 export GENET_MANIFEST=/mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl
 export BASE_CHECKPOINT_PATH=/mnt/nvme/genet/checkpoints/Cosmos3-Edge
 export WAN_VAE_PATH=/mnt/nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth
+export GENET_ARTIFACT_RECEIPT_PATH=/mnt/nvme/genet/artifacts/ARTIFACTS.json
 export HF_HOME=/mnt/nvme/genet/hf-cache
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -504,6 +729,7 @@ export GENET_NODE_CACHE=/mnt/nvme/mds-cache/robotwin_v1
 export GENET_NODE_RUN_ROOT=/mnt/nvme/genet
 export GENET_EXPECTED_GPUS=8
 export GENET_CACHE_READONLY=1
+export GENET_PROTECT_INPUTS=1
 export GENET_IMAGE_PULL_POLICY=missing
 ```
 
@@ -516,6 +742,25 @@ The hostfile and environment file are separate inputs:
 - the hostfile contains SSH transport identities in rank order;
 - the environment file contains public distributed/runtime values and node-local artifact paths;
 - neither file contains registry passwords, Hugging Face tokens, or private SSH keys.
+
+With both files now present, perform the first all-node release verification. This runs the offline Cosmos/Wan/DCP
+semantic verifier, hashes every locked byte, and creates a separate node receipt on each host:
+
+```bash
+bash scripts/launch_cluster_ssh.sh \
+  --hosts /secure/path/genet-hosts.txt \
+  --env /secure/path/s1.env \
+  --image "${GENET_IMAGE_REF}" \
+  --config configs/experiments/stage1_control_32gpu.yaml \
+  --run-id s1-release-verify \
+  --log-dir /mnt/nvme/genet/logs/s1-release-verify \
+  --verify-release-only
+```
+
+Do not copy a receipt from another node. The normal production launch repeats this semantic verification and full hash
+immediately before distributed preflight. It then mounts processed data, the HF cache, Wan VAE, exact load DCP, staging
+receipt, lock, and node receipt read-only inside dry-run/training containers; only outputs remain writable. Use
+`--skip-release-verify` only for controlled diagnostics.
 
 ## 8. One-command SSH launch
 
@@ -533,8 +778,8 @@ The exact launcher syntax is documented by:
 bash scripts/launch_cluster_ssh.sh --help
 ```
 
-Use the same hostfile, environment, image digest, and config for all phases. Run the read-only host checks and Gloo
-preflight alone first:
+Use the same hostfile, environment, image digest, and config for all phases. First stop after the guarded release,
+CPU/Gloo, and 32-rank NCCL collective preflights:
 
 ```bash
 bash scripts/launch_cluster_ssh.sh \
@@ -543,11 +788,27 @@ bash scripts/launch_cluster_ssh.sh \
   --image "${GENET_IMAGE_REF}" \
   --config configs/experiments/stage1_control_32gpu.yaml \
   --run-id s1-control-preflight \
+  --log-dir /mnt/nvme/genet/logs/s1-control-preflight \
   --preflight-only
 ```
 
-After the provider-appropriate `nccl-tests` job passes, start the default guarded sequence. It performs host checks,
-pulls or verifies the image concurrently on all nodes before any rendezvous, runs the Gloo preflight, runs a 32-rank
+The native NCCL phase runs one process per GPU, validates all-reduce contents, benchmarks a configurable buffer, and
+writes an `nccl_preflight_passed` JSON report. Inspect the coordinator logs before training:
+
+```bash
+grep -E 'nccl_preflight_passed|NET/(IB|Socket)|Using network' \
+  /mnt/nvme/genet/logs/s1-control-preflight/nccl-preflight-rank-*.log
+```
+
+A passing collective proves that all 32 ranks can communicate, but it does not by itself prove the provider's expected
+RoCE throughput. Confirm that NCCL selected the IB/RDMA transport instead of an unintended Socket fallback, and compare
+the reported bandwidth with the allocation baseline. For initial cluster qualification, also run the official
+[`NVIDIA/nccl-tests`](https://github.com/NVIDIA/nccl-tests) all-reduce benchmark in the provider-supported MPI/container
+environment; NVIDIA documents that multi-node builds require `MPI=1`. Do not invent MPI/SSH arguments that conflict
+with Hyperbolic's current image or fabric setup.
+
+After those gates pass, start the default guarded sequence. It performs host checks, pulls or verifies the image on all
+nodes, re-hashes the complete release and refreshes receipts, runs Gloo, runs the 32-rank NCCL preflight, runs a 32-rank
 GenET dry run, and only then starts the real training command:
 
 ```bash
@@ -557,6 +818,7 @@ bash scripts/launch_cluster_ssh.sh \
   --image "${GENET_IMAGE_REF}" \
   --config configs/experiments/stage1_control_32gpu.yaml \
   --run-id s1-control-seed42 \
+  --log-dir /mnt/nvme/genet/logs/s1-control-seed42 \
   -- \
   --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl \
   --warm-start /mnt/nvme/genet/checkpoints/Cosmos3-Edge \
@@ -564,18 +826,19 @@ bash scripts/launch_cluster_ssh.sh \
 ```
 
 Do not add `--dry-run` after `--`; the coordinator owns that guard. Use `--dry-run-only` when deliberately stopping after
-the distributed dry run. The `--skip-host-check`, `--skip-preflight`, and `--skip-dry-run` switches exist for controlled
-diagnostics, not for bypassing a failed production gate. Keep the coordinator alive in `tmux` or `systemd`: closing its
-attached SSH sessions stops the job.
+the distributed dry run. The `--skip-host-check`, `--skip-release-verify`, `--skip-preflight`,
+`--skip-nccl-preflight`, and `--skip-dry-run` switches exist for controlled diagnostics, not for bypassing a failed
+production gate. Keep the coordinator alive in `tmux` or `systemd`: closing its attached SSH sessions stops the job.
 
 The required sequence is:
 
 1. pull/verify the immutable image on all nodes;
-2. verify each node's cluster lock and receipt;
+2. re-hash each node's artifacts against the cluster lock and refresh its receipt;
 3. run the four-node CPU/Gloo preflight;
-4. run the provider-appropriate multi-node `nccl-tests` job;
-5. let the coordinator run a 32-rank GenET dry run;
-6. let the same guarded invocation proceed to training.
+4. run the built-in 32-rank NCCL correctness/bandwidth preflight and confirm `NET/IB`;
+5. qualify a new allocation/fabric with provider-appropriate `nccl-tests` and its bandwidth baseline;
+6. let the coordinator run a 32-rank GenET dry run;
+7. let the same guarded invocation proceed to training.
 
 Do not launch training if the lock, receipt, Gloo preflight, or NCCL transport test fails. Do not background four
 independent SSH commands manually and then accept only rank 0's exit status.
@@ -770,9 +1033,8 @@ Because the inference directory is node-local, continuously stage `RUN.json`, `R
 moves to another physical node for resume, copy the complete output directory to that node first. Never let multiple
 nodes independently write the same logical run journal.
 
-Generated actions remain offline/simulator outputs until the remaining command semantics and embodiment-specific safety gates
-are
-implemented. Do not send them directly to a real robot.
+Generated actions remain offline/simulator outputs until the remaining command semantics and embodiment-specific safety
+gates are implemented. Do not send them directly to a real robot.
 
 ## 12. Stop/go checklist
 
@@ -786,10 +1048,11 @@ Do not start paid production training until every item is true:
 - [ ] every node verified the same cluster lock and created its own receipt;
 - [ ] the receipt binds the actual manifest, Wan VAE, HF cache, and exact load DCP paths;
 - [ ] the four-node CPU/Gloo preflight passed with unique node identities;
-- [ ] multi-node `nccl-tests` confirmed the intended RDMA transport rather than socket fallback;
+- [ ] the built-in 32-rank NCCL preflight passed and its logs confirmed the intended RDMA transport;
+- [ ] provider-baselined multi-node `nccl-tests` passed on a new allocation/fabric;
 - [ ] the 32-rank GenET dry run passed;
 - [ ] checkpoint archive publication, consolidation, verification, and prestage were rehearsed;
-- [ ] training and preflight ports are unique to this active job;
+- [ ] training, Gloo-preflight, and NCCL-preflight ports are distinct and unique to this active job;
 - [ ] the output root is new and node-local;
 - [ ] long inference passed a real two-window clean-prefix and rollback smoke test;
 - [ ] durable stage-out is active before any Hyperbolic node can be terminated.

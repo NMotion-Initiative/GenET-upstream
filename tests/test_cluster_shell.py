@@ -10,10 +10,12 @@ SCRIPTS = (
     "check_hyperbolic_host.sh",
     "launch_cluster_ssh.sh",
     "launch_roce.sh",
+    "preflight_nccl.sh",
     "preflight_roce.sh",
     "pull_hyperbolic_image.sh",
     "run_hyperbolic_container.sh",
     "stage_model_artifacts.sh",
+    "verify_cluster_release.sh",
 )
 IMAGE_REF = "registry.example/genet@sha256:" + "a" * 64
 
@@ -116,6 +118,44 @@ def test_container_runner_accepts_inherited_environment(tmp_path: Path) -> None:
     assert "python -V" in invocation
 
 
+def test_container_runner_mounts_verified_inputs_read_only(tmp_path: Path) -> None:
+    environment, docker_log = _fake_host_tools(tmp_path)
+    run_root = Path(environment["GENET_NODE_RUN_ROOT"])
+    protected = {
+        "GENET_PROCESSED_DATA": Path(environment["GENET_NODE_CACHE"]) / "processed" / "train",
+        "HF_HOME": run_root / "hf-cache",
+        "WAN_VAE_PATH": run_root / "artifacts" / "Wan2.2_VAE.pth",
+        "BASE_CHECKPOINT_PATH": run_root / "checkpoints" / "base",
+        "GENET_ARTIFACT_RECEIPT_PATH": run_root / "artifacts" / "ARTIFACTS.json",
+        "GENET_CLUSTER_LOCK": run_root / "release" / "cluster-lock.json",
+        "GENET_CLUSTER_RECEIPT": run_root / "release" / "node-receipt.json",
+    }
+    for name, path in protected.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name in {"GENET_PROCESSED_DATA", "HF_HOME", "BASE_CHECKPOINT_PATH"}:
+            path.mkdir()
+        else:
+            path.write_text(name, encoding="utf-8")
+        environment[name] = str(path)
+    environment["GENET_PROTECT_INPUTS"] = "1"
+
+    subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts" / "run_hyperbolic_container.sh"),
+            "-",
+            IMAGE_REF,
+            "python",
+            "-V",
+        ],
+        check=True,
+        env=environment,
+    )
+    invocation = docker_log.read_text(encoding="utf-8")
+    for path in protected.values():
+        assert f"src={path}\\,dst={path}\\,readonly" in invocation
+
+
 def test_single_controller_dry_run_fans_out_locally(tmp_path: Path) -> None:
     environment, docker_log = _fake_host_tools(tmp_path)
     hostfile = tmp_path / "hosts.txt"
@@ -129,8 +169,16 @@ def test_single_controller_dry_run_fans_out_locally(tmp_path: Path) -> None:
                 "export MASTER_ADDR=127.0.0.1",
                 "export MASTER_PORT=29500",
                 "export PREFLIGHT_PORT=29499",
+                "export NCCL_PREFLIGHT_PORT=29498",
                 f"export GENET_NODE_CACHE={environment['GENET_NODE_CACHE']}",
                 f"export GENET_NODE_RUN_ROOT={environment['GENET_NODE_RUN_ROOT']}",
+                f"export GENET_CLUSTER_LOCK={environment['GENET_NODE_RUN_ROOT']}/release/lock.json",
+                f"export GENET_CLUSTER_RECEIPT={environment['GENET_NODE_RUN_ROOT']}/release/receipt.json",
+                f"export GENET_PROCESSED_DATA={environment['GENET_NODE_CACHE']}/processed/train",
+                f"export WAN_VAE_PATH={environment['GENET_NODE_RUN_ROOT']}/artifacts/vae.pth",
+                f"export BASE_CHECKPOINT_PATH={environment['GENET_NODE_RUN_ROOT']}/checkpoints/base",
+                f"export HF_HOME={environment['GENET_NODE_RUN_ROOT']}/hf-cache",
+                f"export GENET_ARTIFACT_RECEIPT_PATH={environment['GENET_NODE_RUN_ROOT']}/artifacts/ARTIFACTS.json",
             )
         )
         + "\n",
@@ -167,12 +215,16 @@ def test_single_controller_dry_run_fans_out_locally(tmp_path: Path) -> None:
     )
     assert "Dry-run-only launch completed" in result.stdout
     invocations = docker_log.read_text(encoding="utf-8").splitlines()
-    assert len(invocations) == 4
+    assert len(invocations) == 6
     assert sum("image inspect" in line for line in invocations) == 2
+    assert any("scripts/verify_cluster_release.sh" in line for line in invocations)
     assert any("scripts/preflight_roce.sh" in line for line in invocations)
+    assert any("scripts/preflight_nccl.sh" in line for line in invocations)
     assert any("scripts/launch_roce.sh" in line and "--dry-run" in line for line in invocations)
     assert (logs / "image-pull-rank-0.log").is_file()
+    assert (logs / "release-verify-rank-0.log").is_file()
     assert (logs / "preflight-rank-0.log").is_file()
+    assert (logs / "nccl-preflight-rank-0.log").is_file()
     assert (logs / "dry-run-rank-0.log").is_file()
 
 
@@ -219,3 +271,70 @@ def test_training_launcher_rejects_inherited_hf_token(tmp_path: Path) -> None:
     )
     assert result.returncode == 2
     assert "unset HF_TOKEN before training" in result.stderr
+
+
+def test_release_verifier_maps_every_required_artifact(tmp_path: Path) -> None:
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    invocation_log = tmp_path / "cluster-lock.log"
+    stage_log = tmp_path / "stage.log"
+    _write_executable(
+        binary_dir / "genet-cluster-lock",
+        """#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$@" > "${FAKE_CLUSTER_LOCK_LOG}"
+""",
+    )
+    _write_executable(
+        binary_dir / "genet-stage-artifacts",
+        """#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$@" > "${FAKE_STAGE_LOG}"
+""",
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{binary_dir}:{environment['PATH']}",
+            "FAKE_CLUSTER_LOCK_LOG": str(invocation_log),
+            "FAKE_STAGE_LOG": str(stage_log),
+            "GENET_NODE_RUN_ROOT": str(tmp_path / "run"),
+            "GENET_CLUSTER_LOCK": str(tmp_path / "cluster-lock.json"),
+            "GENET_CLUSTER_RECEIPT": str(tmp_path / "node-receipt.json"),
+            "GENET_PROCESSED_DATA": str(tmp_path / "processed"),
+            "WAN_VAE_PATH": str(tmp_path / "Wan2.2_VAE.pth"),
+            "BASE_CHECKPOINT_PATH": str(tmp_path / "checkpoint"),
+            "HF_HOME": str(tmp_path / "hf-cache"),
+            "GENET_ARTIFACT_RECEIPT_PATH": str(tmp_path / "ARTIFACTS.json"),
+        }
+    )
+    subprocess.run(
+        ["bash", str(ROOT / "scripts" / "verify_cluster_release.sh")],
+        check=True,
+        env=environment,
+    )
+    invocation = invocation_log.read_text(encoding="utf-8").splitlines()
+    assert stage_log.read_text(encoding="utf-8").splitlines() == [
+        "--run-root",
+        str(tmp_path / "run"),
+        "--verify-only",
+    ]
+    assert invocation[:5] == [
+        "verify",
+        "--lock",
+        str(tmp_path / "cluster-lock.json"),
+        "--receipt",
+        str(tmp_path / "node-receipt.json"),
+    ]
+    artifacts = [
+        invocation[index + 1]
+        for index, value in enumerate(invocation[:-1])
+        if value == "--artifact"
+    ]
+    assert artifacts == [
+        f"processed_data={tmp_path / 'processed'}",
+        f"wan_vae={tmp_path / 'Wan2.2_VAE.pth'}",
+        f"artifact_receipt={tmp_path / 'ARTIFACTS.json'}",
+        f"training_checkpoint={tmp_path / 'checkpoint'}",
+        f"hf_cache={tmp_path / 'hf-cache'}",
+    ]

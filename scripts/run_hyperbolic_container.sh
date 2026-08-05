@@ -97,6 +97,43 @@ case "${GENET_CACHE_READONLY:-1}" in
     ;;
 esac
 
+protected_input_args=()
+case "${GENET_PROTECT_INPUTS:-0}" in
+  1|true|TRUE|yes|YES|on|ON)
+    protected_variables=(
+      GENET_PROCESSED_DATA
+      HF_HOME
+      WAN_VAE_PATH
+      BASE_CHECKPOINT_PATH
+      GENET_ARTIFACT_RECEIPT_PATH
+      GENET_CLUSTER_LOCK
+      GENET_CLUSTER_RECEIPT
+    )
+    if [[ -n "${GENET_NORMALIZATION_PATH:-}" ]]; then
+      protected_variables+=(GENET_NORMALIZATION_PATH)
+    fi
+    for variable_name in "${protected_variables[@]}"; do
+      protected_path="${!variable_name:-}"
+      if [[ -z "${protected_path}" || "${protected_path}" != /* ]]; then
+        echo "${variable_name} must be an absolute path when GENET_PROTECT_INPUTS=1" >&2
+        exit 2
+      fi
+      if [[ ! -e "${protected_path}" ]]; then
+        echo "Protected input does not exist (${variable_name}): ${protected_path}" >&2
+        exit 2
+      fi
+      protected_input_args+=(
+        --mount "type=bind,src=${protected_path},dst=${protected_path},readonly"
+      )
+    done
+    ;;
+  0|false|FALSE|no|NO|off|OFF) ;;
+  *)
+    echo "GENET_PROTECT_INPUTS must be boolean" >&2
+    exit 2
+    ;;
+esac
+
 case "${IMAGE_PULL_POLICY}" in
   always|missing|never) ;;
   *)
@@ -125,6 +162,7 @@ exec docker run \
   --workdir /opt/genet \
   --mount "${cache_mount}" \
   --mount "type=bind,src=${RUN_ROOT},dst=${RUN_ROOT}" \
+  ${protected_input_args[@]+"${protected_input_args[@]}"} \
   "${rdma_args[@]}" \
   "${env_args[@]}" \
   ${detach_args[@]+"${detach_args[@]}"} \

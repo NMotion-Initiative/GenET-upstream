@@ -128,16 +128,19 @@ bash scripts/launch_cluster_ssh.sh \
   --image "${GENET_IMAGE_REF}" \
   --config configs/experiments/stage1_control_32gpu.yaml \
   --run-id s1-control-seed42 \
+  --log-dir /mnt/nvme/genet/logs/s1-control-seed42 \
   -- \
   --manifest /mnt/nvme/mds-cache/robotwin_v1/genet/processed/train/manifest.jsonl \
   --warm-start /mnt/nvme/genet/checkpoints/Cosmos3-Edge \
   --output-dir /mnt/nvme/genet/outputs/s1-control-seed42
 ```
 
-The launcher runs host checks, resolves the immutable image concurrently on all nodes, runs a four-node Gloo preflight,
-and runs a 32-rank NCCL/Cosmos dry run before training. Keep this attached coordinator command inside `tmux` or a
-supervised service. See the runbook for image construction under `/dev/shm`, model/data staging, Docker storage
-placement, RoCE discovery, inference, and failure recovery.
+The launcher runs host checks, resolves the immutable image concurrently, re-hashes every node-local release and
+refreshes its receipt, runs a four-node Gloo consistency check, runs a 32-rank NCCL correctness/bandwidth preflight, and
+runs a 32-rank Cosmos dry run before training. Verified model inputs are read-only binds while the output root remains
+writable. Keep this attached coordinator command inside `tmux` or a supervised service. See the runbook for the
+control-node checkout, host installation, image construction under `/dev/shm`, registry login, model/data staging,
+Docker storage placement, RoCE discovery, inference, and failure recovery.
 
 ## Cosmos3-Edge Production Environment
 
@@ -219,7 +222,7 @@ prepare data, weights, tokenizer cache, and one cluster lock on a staging host
         ↓
 copy the release to each node's local NVMe and verify every copy
         ↓
-run the CPU/Gloo node preflight, nccl-tests, then a 4-node GenET dry run
+re-hash/refresh receipts, run CPU/Gloo, 32-rank NCCL, then the GenET dry run
         ↓
 start training with the runtime all-rank preflight enabled
         ↓
@@ -267,8 +270,9 @@ genet-cluster-lock verify \
 ```
 
 The node-local receipt binds logical artifacts to the paths that were actually verified. Strict Cosmos startup rejects a
-manifest, Wan VAE, HF cache, or load checkpoint that is not bound to that receipt. The prologue must stop the complete job
-when any node fails verification; it must also keep the verified release read-only until the job finishes.
+manifest, Wan VAE, HF cache, or load checkpoint that is not bound to that receipt. The Hyperbolic coordinator performs
+this full re-hash concurrently on all nodes before every production launch, refreshes each node's receipt, and mounts the
+verified inputs read-only. Any mismatch stops the complete job.
 
 ### 3. Enable the strict runtime contract
 
@@ -283,22 +287,27 @@ export GENET_COSMOS_REVISION='a904d2d36b774a51dd06ff9ff906816b1a04f579'
 export GENET_CLUSTER_LOCK=/local_nvme/genet/release/cluster-lock.json
 export GENET_CLUSTER_RECEIPT=/local_nvme/genet/release/node-receipt.json
 export GENET_HF_SNAPSHOT_REVISION='2a00e87e9976dc3ed5533dd18caf4cdbc3a1bcb2'
+export GENET_PROTECT_INPUTS=1
+export GENET_ARTIFACT_RECEIPT_ARTIFACT=artifact_receipt
+export GENET_ARTIFACT_RECEIPT_PATH=/local_nvme/genet/artifacts/ARTIFACTS.json
 export WAN_VAE_PATH=/local_nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth
 export HF_HOME=/local_nvme/genet/hf-cache
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
-Before starting the 32-rank NCCL group, run the one-process-per-node CPU/Gloo preflight on all four nodes:
+Run the one-process-per-node CPU/Gloo preflight first, followed by the one-process-per-GPU NCCL preflight:
 
 ```bash
 bash scripts/preflight_roce.sh
+bash scripts/preflight_nccl.sh
 ```
 
 It verifies the strict runtime identity, one unique physical node identity per rank, eight visible GPUs per node, GPU
 model/capability/memory, and the NVIDIA driver, then compares all four node reports over a bounded, dedicated
-`PREFLIGHT_PORT`. This catches environment drift before the expensive NCCL model process group is created. Run multi-node
-`nccl-tests` separately to validate the actual RoCE data path.
+`PREFLIGHT_PORT`. The NCCL phase then runs a correct 32-rank all-reduce and reports timing/bandwidth. Confirm its
+`NCCL_DEBUG=INFO` logs selected `NET/IB`; run official multi-node `nccl-tests` separately when qualifying a new
+allocation or fabric against the provider bandwidth baseline.
 
 At startup, GenET all-gathers and compares:
 

@@ -42,6 +42,7 @@ genet-checkpoint = "genet.cli.checkpoint:main"
 genet-generate-long = "genet.cli.generate_long:main"
 genet-cluster-lock = "genet.cli.cluster_lock:main"
 genet-cluster-preflight = "genet.cli.cluster_preflight:main"
+genet-nccl-preflight = "genet.cli.nccl_preflight:main"
 genet-stage-artifacts = "genet.cli.stage_artifacts:main"
 
 [tool.setuptools.packages.find]

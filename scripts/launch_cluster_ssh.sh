@@ -27,16 +27,20 @@ Required inputs:
   --config PATH         Training config path inside the application image.
 
 Default sequence:
-  host checks -> concurrent image pull -> CPU/Gloo preflight -> 32-rank dry run -> training
+  host checks -> concurrent image pull -> release re-hash/receipt ->
+  CPU/Gloo preflight -> 32-rank NCCL preflight -> 32-rank dry run -> training
 
 Options:
   --run-id ID           Stable container/log prefix (default: UTC timestamp + PID).
   --log-dir DIR         New coordinator-side log directory (default: ./logs/<run-id>).
   --ssh-option VALUE    Additional ssh -o option; may be repeated.
   --skip-host-check     Skip the read-only host prerequisite inventory.
-  --skip-preflight      Skip the CPU/Gloo cluster preflight.
+  --skip-release-verify Skip the full node-local artifact re-hash/receipt refresh.
+  --skip-preflight      Skip both CPU/Gloo and NCCL cluster preflights.
+  --skip-nccl-preflight Skip only the 32-rank NCCL correctness/bandwidth preflight.
   --skip-dry-run        Start training without the automatic dry run.
-  --preflight-only      Stop after host checks and CPU/Gloo preflight.
+  --verify-release-only Stop after image pull and release verification.
+  --preflight-only      Stop after release, CPU/Gloo, and NCCL preflights.
   --dry-run-only        Stop after the distributed GenET dry run.
   -h, --help            Show this help.
 
@@ -76,8 +80,11 @@ CONFIG_PATH=""
 RUN_ID=""
 LOG_DIR=""
 SKIP_HOST_CHECK=0
+SKIP_RELEASE_VERIFY=0
 SKIP_PREFLIGHT=0
+SKIP_NCCL_PREFLIGHT=0
 SKIP_DRY_RUN=0
+STOP_AFTER_RELEASE_VERIFY=0
 STOP_AFTER_PREFLIGHT=0
 STOP_AFTER_DRY_RUN=0
 SSH_OPTIONS=(
@@ -128,12 +135,24 @@ while (( $# > 0 )); do
       SKIP_HOST_CHECK=1
       shift
       ;;
+    --skip-release-verify)
+      SKIP_RELEASE_VERIFY=1
+      shift
+      ;;
     --skip-preflight)
       SKIP_PREFLIGHT=1
       shift
       ;;
+    --skip-nccl-preflight)
+      SKIP_NCCL_PREFLIGHT=1
+      shift
+      ;;
     --skip-dry-run)
       SKIP_DRY_RUN=1
+      shift
+      ;;
+    --verify-release-only)
+      STOP_AFTER_RELEASE_VERIFY=1
       shift
       ;;
     --preflight-only)
@@ -168,8 +187,11 @@ TRAIN_ARGS=("$@")
 [[ "${IMAGE_REF}" =~ ^[^[:space:]]+@sha256:[0-9a-fA-F]{64}$ ]] \
   || die "--image must use repository@sha256:<64 hex>"
 [[ -n "${CONFIG_PATH}" ]] || die "--config is required"
-(( STOP_AFTER_PREFLIGHT == 0 || STOP_AFTER_DRY_RUN == 0 )) \
-  || die "--preflight-only and --dry-run-only are mutually exclusive"
+stop_mode_count=$((STOP_AFTER_RELEASE_VERIFY + STOP_AFTER_PREFLIGHT + STOP_AFTER_DRY_RUN))
+(( stop_mode_count <= 1 )) \
+  || die "--verify-release-only, --preflight-only, and --dry-run-only are mutually exclusive"
+(( STOP_AFTER_RELEASE_VERIFY == 0 || SKIP_RELEASE_VERIFY == 0 )) \
+  || die "--verify-release-only cannot be combined with --skip-release-verify"
 (( STOP_AFTER_PREFLIGHT == 0 || SKIP_PREFLIGHT == 0 )) \
   || die "--preflight-only cannot be combined with --skip-preflight"
 (( STOP_AFTER_DRY_RUN == 0 || SKIP_DRY_RUN == 0 )) \
@@ -196,15 +218,43 @@ done
 : "${MASTER_ADDR:?Set MASTER_ADDR in the shared environment file}"
 : "${MASTER_PORT:?Set MASTER_PORT in the shared environment file}"
 : "${PREFLIGHT_PORT:?Set PREFLIGHT_PORT in the shared environment file}"
+: "${NCCL_PREFLIGHT_PORT:?Set NCCL_PREFLIGHT_PORT to a third, dedicated shared port}"
 : "${GENET_NODE_CACHE:?Set GENET_NODE_CACHE in the shared environment file}"
 : "${GENET_NODE_RUN_ROOT:?Set GENET_NODE_RUN_ROOT in the shared environment file}"
+if (( SKIP_RELEASE_VERIFY == 0 )); then
+  for required_name in \
+    GENET_CLUSTER_LOCK \
+    GENET_CLUSTER_RECEIPT \
+    GENET_PROCESSED_DATA \
+    WAN_VAE_PATH \
+    BASE_CHECKPOINT_PATH \
+    HF_HOME \
+    GENET_ARTIFACT_RECEIPT_PATH; do
+    [[ -n "${!required_name:-}" ]] \
+      || die "Set ${required_name} in the shared environment file for release verification"
+  done
+fi
+case "${GENET_STRICT_ENV:-0}" in
+  1|true|TRUE|yes|YES|on|ON)
+    case "${GENET_CACHE_READONLY:-0}" in
+      1|true|TRUE|yes|YES|on|ON) ;;
+      *) die "Strict production launch requires GENET_CACHE_READONLY=1" ;;
+    esac
+    case "${GENET_PROTECT_INPUTS:-0}" in
+      1|true|TRUE|yes|YES|on|ON) ;;
+      *) die "Strict production launch requires GENET_PROTECT_INPUTS=1" ;;
+    esac
+    ;;
+  0|false|FALSE|no|NO|off|OFF) ;;
+  *) die "GENET_STRICT_ENV must be boolean" ;;
+esac
 GENET_IMAGE_PULL_POLICY="${GENET_IMAGE_PULL_POLICY:-missing}"
 case "${GENET_IMAGE_PULL_POLICY}" in
   always|missing|never) ;;
   *) die "GENET_IMAGE_PULL_POLICY must be always, missing, or never" ;;
 esac
 
-for integer_name in NNODES NPROC_PER_NODE MASTER_PORT PREFLIGHT_PORT; do
+for integer_name in NNODES NPROC_PER_NODE MASTER_PORT PREFLIGHT_PORT NCCL_PREFLIGHT_PORT; do
   integer_value="${!integer_name}"
   [[ "${integer_value}" =~ ^[0-9]+$ ]] \
     || die "${integer_name} must be a non-negative integer: ${integer_value}"
@@ -212,7 +262,13 @@ done
 (( NNODES > 0 && NPROC_PER_NODE > 0 )) || die "NNODES and NPROC_PER_NODE must be positive"
 (( MASTER_PORT > 0 && MASTER_PORT <= 65535 )) || die "invalid MASTER_PORT: ${MASTER_PORT}"
 (( PREFLIGHT_PORT > 0 && PREFLIGHT_PORT <= 65535 )) || die "invalid PREFLIGHT_PORT: ${PREFLIGHT_PORT}"
+(( NCCL_PREFLIGHT_PORT > 0 && NCCL_PREFLIGHT_PORT <= 65535 )) \
+  || die "invalid NCCL_PREFLIGHT_PORT: ${NCCL_PREFLIGHT_PORT}"
 (( MASTER_PORT != PREFLIGHT_PORT )) || die "MASTER_PORT and PREFLIGHT_PORT must differ"
+(( MASTER_PORT != NCCL_PREFLIGHT_PORT )) \
+  || die "MASTER_PORT and NCCL_PREFLIGHT_PORT must differ"
+(( PREFLIGHT_PORT != NCCL_PREFLIGHT_PORT )) \
+  || die "PREFLIGHT_PORT and NCCL_PREFLIGHT_PORT must differ"
 if (( NNODES > 1 )); then
   case "${MASTER_ADDR}" in
     localhost|127.*|::1) die "MASTER_ADDR must be reachable from peer nodes" ;;
@@ -424,7 +480,7 @@ launch_container_phase() {
   local phase="$1"
   shift
   local -a payload=("$@")
-  local rank target container_name log_path remote_command
+  local rank target container_name log_path remote_command protect_inputs
   local -a environment
   echo "Starting phase ${phase} on ${NNODES} nodes; logs: ${LOG_DIR}"
   ACTIVE_PIDS=()
@@ -434,12 +490,17 @@ launch_container_phase() {
     target="${HOSTS[rank]}"
     container_name="${RUN_ID}-${LAUNCH_ID:0:12}-${phase}-r${rank}"
     log_path="${LOG_DIR}/${phase}-rank-${rank}.log"
+    protect_inputs="${GENET_PROTECT_INPUTS:-0}"
+    if [[ "${phase}" == "release-verify" ]]; then
+      protect_inputs=0
+    fi
     environment=(
       env
       "${FORWARDED_ENV[@]}"
       "NODE_RANK=${rank}"
       "GENET_CONTAINER_NAME=${container_name}"
       "GENET_LAUNCH_ID=${LAUNCH_ID}"
+      "GENET_PROTECT_INPUTS=${protect_inputs}"
       GENET_IMAGE_PULL_POLICY=never
       GENET_CONTAINER_DETACH=0
       GENET_CONTAINER_RM=1
@@ -478,8 +539,18 @@ if (( SKIP_HOST_CHECK == 0 )); then
   launch_host_checks
 fi
 launch_image_pulls
+if (( SKIP_RELEASE_VERIFY == 0 )); then
+  launch_container_phase release-verify bash scripts/verify_cluster_release.sh
+fi
+if (( STOP_AFTER_RELEASE_VERIFY == 1 )); then
+  echo "Release verification completed on all nodes"
+  exit 0
+fi
 if (( SKIP_PREFLIGHT == 0 )); then
   launch_container_phase preflight bash scripts/preflight_roce.sh
+fi
+if (( SKIP_PREFLIGHT == 0 && SKIP_NCCL_PREFLIGHT == 0 )); then
+  launch_container_phase nccl-preflight bash scripts/preflight_nccl.sh
 fi
 if (( STOP_AFTER_PREFLIGHT == 1 )); then
   echo "Preflight-only launch completed"

@@ -160,15 +160,19 @@ revision，示例见 [`configs/cluster/roce_4x8.env.example`](../configs/cluster
 hash、embedded build revision、可发现的 Git revision、cluster-lock hash 与 path-independent receipt contract。
 内容锁负责“大文件实际字节”，receipt 负责运行路径绑定，collective 负责“rank 环境漂移”；三者不能互相替代。
 
-正式 32-rank NCCL 作业前，四个节点先各启动一个 CPU/Gloo preflight 进程：
+正式训练前先运行 one-process-per-node CPU/Gloo identity preflight，再运行 one-process-per-GPU 的 32-rank
+NCCL correctness/bandwidth preflight：
 
 ```bash
 bash scripts/preflight_roce.sh
+bash scripts/preflight_nccl.sh
 ```
 
 它使用带 timeout 的独立 `PREFLIGHT_PORT` 比较四个节点的严格运行时 identity，拒绝重复物理 node identity，
-并检查每节点可见 GPU 数量、型号、compute capability、显存与 NVIDIA driver。通过后仍需按第 9 节运行
-nccl-tests；CPU/Gloo preflight 只能提前发现环境漂移，不能替代 RoCE/NCCL 性能与连通性验收。
+并检查每节点可见 GPU 数量、型号、compute capability、显存与 NVIDIA driver。随后 NCCL preflight 通过独立
+`NCCL_PREFLIGHT_PORT` 在全部 GPU 上验证 all-reduce 数值并报告带宽。必须从 `NCCL_DEBUG=INFO` 日志确认选择
+`NET/IB` 而非非预期 Socket fallback；新 allocation/fabric 仍需按第 9 节用 provider baseline 跑官方
+nccl-tests，内置 preflight 不是完整硬件带宽验收的替代品。
 
 ## 3. 数据训练前检查
 
