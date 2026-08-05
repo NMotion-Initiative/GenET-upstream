@@ -58,7 +58,11 @@ RUN --mount=type=tmpfs,target=/tmp \
     && curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" \
         --output /tmp/install-uv.sh \
     && env UV_UNMANAGED_INSTALL=/usr/local/bin sh /tmp/install-uv.sh \
-    && test "$(uv --version)" = "uv ${UV_VERSION}"
+    && uv_version_output="$(uv --version)" \
+    && case "${uv_version_output}" in \
+        "uv ${UV_VERSION}"|"uv ${UV_VERSION} "*) ;; \
+        *) echo "Unexpected uv version: ${uv_version_output}" >&2; exit 2 ;; \
+       esac
 
 WORKDIR ${COSMOS_DIR}
 RUN --mount=type=cache,target=/root/.cache/uv \
