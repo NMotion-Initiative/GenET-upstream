@@ -926,6 +926,15 @@ def _stage_artifacts_once(
         _require_ref_compatible(paths.cosmos_ref, revision, force=force)
     wan = _stage_wan(spec, paths, verify_only=verify_only, force=force)
     converted = not download_only
+    if verify_only and converted and paths.receipt.is_file():
+        try:
+            existing_receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing_receipt = {}
+        # A download-only staging deliberately records converted=false; verify
+        # what the receipt claims instead of demanding a DCP that was never
+        # produced (whole-model-per-GPU deployments skip conversion).
+        converted = bool(existing_receipt.get("converted", True))
     if converted:
         _convert_dcp(
             spec,

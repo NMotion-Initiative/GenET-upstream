@@ -1,0 +1,33 @@
+_base_: ../base.yaml
+
+# DDP deployment: every rank holds one complete model replica (3.37B fits a
+# single H100), warm-started directly from the official safetensors snapshot.
+# No FSDP sharding and no DCP conversion of the pretrained checkpoint.
+
+data:
+  expected_embodiments:
+    - ARX-X5
+    - aloha-agilex
+    - franka-panda
+    - piper
+    - ur5-wsg
+  require_bidirectional_pairs: true
+
+model:
+  backend: cosmos3_edge
+  # Adapter infers the native 48-channel Wan2.2 latent width from Cosmos.
+  latent_channels: 48
+  reference:
+    enabled: false
+  parallelism:
+    data_parallel_shard_degree: 1
+    data_parallel_replicate_degree: 32
+    context_parallel_shard_degree: 1
+    cfg_parallel_shard_degree: 1
+
+train:
+  stage: control
+  grad_accum_steps: 1
+
+checkpoint:
+  output_dir: outputs/stage1_control_32gpu_ddp

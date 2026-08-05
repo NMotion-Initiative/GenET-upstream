@@ -550,6 +550,7 @@ class CosmosCrossEmbodimentModel(_OmniMoTModel):  # type: ignore[misc]
         copy_shared_reference_to_dual_on_warm_start: bool = False,
         initialize_ema_from_regular_on_warm_start: bool = True,
         condition_dropout: float = 0.0,
+        hf_warm_start_path: str | None = None,
         **kwargs: Any,
     ) -> None:
         _require_cosmos()
@@ -579,6 +580,10 @@ class CosmosCrossEmbodimentModel(_OmniMoTModel):  # type: ignore[misc]
         )
         object.__setattr__(self, "_genet_condition_dropout", float(condition_dropout))
         object.__setattr__(self, "_genet_warm_start_copy_applied", False)
+        object.__setattr__(
+            self, "_genet_hf_warm_start_path", hf_warm_start_path or None
+        )
+        object.__setattr__(self, "_genet_hf_warm_start_applied", False)
         super().__init__(*args, **kwargs)
         controller = self.net.cross_embodiment_adapter
         # The controller is already registered below self.net. Keep only a plain
@@ -619,6 +624,38 @@ class CosmosCrossEmbodimentModel(_OmniMoTModel):  # type: ignore[misc]
                 copied += 1
         return copied
 
+    def _load_hf_snapshot_every_rank(self, snapshot: str) -> None:
+        """DDP whole-model warm start: each rank reads the complete official
+        safetensors snapshot into its own full replica of ``self.net``.
+
+        The freshly initialized GenET adapter parameters live under the single
+        ``cross_embodiment_adapter.`` prefix and are excluded, matching the
+        non-strict handling the DCP warm-start path applies to them.
+        """
+
+        from pathlib import Path
+
+        import torch.distributed.checkpoint as distributed_checkpoint
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+        from cosmos_framework.inference.model import (
+            _DiffusersHuggingFaceStorageReader,
+            _DiffusersLoadPlanner,
+        )
+
+        snapshot_path = Path(snapshot)
+        state_dict = {
+            key: value
+            for key, value in get_model_state_dict(self.net).items()
+            if not key.startswith("cross_embodiment_adapter.")
+        }
+        distributed_checkpoint.load(
+            state_dict,
+            storage_reader=_DiffusersHuggingFaceStorageReader(snapshot_path),
+            planner=_DiffusersLoadPlanner(snapshot_path),
+            no_dist=True,
+        )
+
     def load_pretrained_model_if_needed(
         self,
         *,
@@ -627,6 +664,19 @@ class CosmosCrossEmbodimentModel(_OmniMoTModel):  # type: ignore[misc]
     ) -> None:
         """Run the optional shared→dual migration after upstream DCP loading."""
 
+        hf_snapshot = self._genet_hf_warm_start_path
+        if (
+            hf_snapshot
+            and not has_resumable_checkpoint
+            and not has_load_path
+            and not self._genet_hf_warm_start_applied
+        ):
+            self._load_hf_snapshot_every_rank(hf_snapshot)
+            object.__setattr__(self, "_genet_hf_warm_start_applied", True)
+            # From here on this is a warm start: the generation pathway is
+            # populated, EMA must be reset from it, and the understanding->
+            # generation copy must be skipped.
+            has_load_path = True
         super().load_pretrained_model_if_needed(
             has_resumable_checkpoint=has_resumable_checkpoint,
             has_load_path=has_load_path,

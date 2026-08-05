@@ -48,17 +48,34 @@ def _manifest_domains(path: Path, maximum: int) -> dict[str, int]:
     return {name: index for index, name in enumerate(ordered)}
 
 
+def is_hf_snapshot(path: Path) -> bool:
+    """Whole-model-per-GPU deployments warm-start straight from the official
+    safetensors/diffusers snapshot instead of a converted DCP."""
+
+    return path.is_dir() and (
+        (path / "model_index.json").is_file()
+        or (path / "model.safetensors.index.json").is_file()
+    )
+
+
 def _checkpoint_load_path(config: ProjectConfig) -> tuple[str, bool]:
     """Return ``(path, exact_resume)`` for the upstream DCP checkpointer."""
 
     def require_dcp(path: Path) -> None:
         if not path.is_dir():
             raise FileNotFoundError(f"Cosmos DCP directory does not exist: {path}")
+        if is_hf_snapshot(path):
+            return
         if not any(candidate.name == ".metadata" for candidate in path.rglob(".metadata")):
             raise ValueError(f"Cosmos DCP directory has no .metadata: {path}")
 
     if config.checkpoint.resume:
         path = Path(config.checkpoint.resume).expanduser().resolve()
+        if is_hf_snapshot(path):
+            raise ValueError(
+                "an exact resume needs a committed training DCP with optimizer "
+                f"state, not the pretrained HF snapshot: {path}"
+            )
         if config.checkpoint.require_committed:
             verify_committed_checkpoint(path)
         require_dcp(path)
@@ -396,7 +413,15 @@ def _build_cosmos_config(
     _disable_online_sampling(resolved.trainer.callbacks)
 
     checkpoint_path, exact_resume = checkpoint_load or _checkpoint_load_path(project)
-    resolved.checkpoint.load_path = checkpoint_path
+    if is_hf_snapshot(Path(checkpoint_path)):
+        # DDP whole-model warm start: the upstream DCP checkpointer never sees
+        # the safetensors snapshot. Every rank loads the complete model inside
+        # CosmosCrossEmbodimentModel.load_pretrained_model_if_needed instead.
+        assert not exact_resume
+        resolved.checkpoint.load_path = ""
+        resolved.model["hf_warm_start_path"] = checkpoint_path
+    else:
+        resolved.checkpoint.load_path = checkpoint_path
     resolved.checkpoint.load_training_state = exact_resume
     resolved.checkpoint.strict_resume = exact_resume
     resolved.checkpoint.save_iter = project.checkpoint.save_every
