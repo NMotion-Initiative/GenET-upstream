@@ -79,3 +79,23 @@ checkpoint:
   save_every: 1000
   require_committed: true
   copy_shared_reference_to_dual: false
+
+# W&B + sparse eval videos. Defaults keep production training unblocked;
+# Hyperbolic online W&B needs WANDB_API_KEY and a proxy / port-forward.
+logging:
+  wandb:
+    mode: disabled
+    project: genet
+    group: cross_embodiment
+    name: null
+    entity: null
+  eval_video:
+    enabled: false
+    every_n_steps: 1000
+    num_samples: 2
+    manifest: null
+    output_subdir: eval_videos
+    fps: null
+    log_to_wandb: true
+    run_at_start: false
+    num_sampling_steps: 35

@@ -123,12 +123,47 @@ class CheckpointConfig:
 
 
 @dataclass
+class WandbLoggingConfig:
+    """Cosmos job.wandb_mode bridge. Online needs WANDB_API_KEY (+ proxy on airgapped hosts)."""
+
+    mode: Literal["disabled", "offline", "online"] = "disabled"
+    project: str = "genet"
+    group: str = "cross_embodiment"
+    name: str | None = None
+    entity: str | None = None
+
+
+@dataclass
+class EvalVideoConfig:
+    """Sparse GenET-conditioned sampling; writes local MP4 and optionally logs to W&B."""
+
+    enabled: bool = False
+    every_n_steps: int = 1_000
+    num_samples: int = 2
+    # When set, prefetch packed batches from this processed manifest (val preferred).
+    # When null, sample from the current training micro-batch (still GenET-conditioned).
+    manifest: str | None = None
+    output_subdir: str = "eval_videos"
+    fps: float | None = None
+    log_to_wandb: bool = True
+    run_at_start: bool = False
+    num_sampling_steps: int = 35
+
+
+@dataclass
+class LoggingConfig:
+    wandb: WandbLoggingConfig = field(default_factory=WandbLoggingConfig)
+    eval_video: EvalVideoConfig = field(default_factory=EvalVideoConfig)
+
+
+@dataclass
 class ProjectConfig:
     data: DataConfig = field(default_factory=DataConfig)
     loader: LoaderConfig = field(default_factory=LoaderConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     def validate(self, world_size: int | None = None) -> None:
         if self.data.reference_mode not in {"stored", "deterministic"}:
@@ -303,6 +338,38 @@ class ProjectConfig:
                 "checkpoint.copy_shared_reference_to_dual requires "
                 "model.reference.projection_mode=dual"
             )
+        wandb = self.logging.wandb
+        if wandb.mode not in {"disabled", "offline", "online"}:
+            raise ValueError("logging.wandb.mode must be disabled, offline, or online")
+        if not isinstance(wandb.project, str) or not wandb.project.strip():
+            raise ValueError("logging.wandb.project must be a non-empty string")
+        if not isinstance(wandb.group, str) or not wandb.group.strip():
+            raise ValueError("logging.wandb.group must be a non-empty string")
+        if wandb.name is not None and (
+            not isinstance(wandb.name, str) or not wandb.name.strip()
+        ):
+            raise ValueError("logging.wandb.name must be null or a non-empty string")
+        if wandb.entity is not None and (
+            not isinstance(wandb.entity, str) or not wandb.entity.strip()
+        ):
+            raise ValueError("logging.wandb.entity must be null or a non-empty string")
+        eval_video = self.logging.eval_video
+        if not isinstance(eval_video.enabled, bool):
+            raise ValueError("logging.eval_video.enabled must be boolean")
+        if eval_video.every_n_steps < 1:
+            raise ValueError("logging.eval_video.every_n_steps must be positive")
+        if eval_video.num_samples < 1:
+            raise ValueError("logging.eval_video.num_samples must be positive")
+        if eval_video.manifest is not None and (
+            not isinstance(eval_video.manifest, str) or not eval_video.manifest.strip()
+        ):
+            raise ValueError("logging.eval_video.manifest must be null or a non-empty path")
+        if not isinstance(eval_video.output_subdir, str) or not eval_video.output_subdir.strip():
+            raise ValueError("logging.eval_video.output_subdir must be a non-empty string")
+        if eval_video.fps is not None and eval_video.fps <= 0:
+            raise ValueError("logging.eval_video.fps must be positive when set")
+        if eval_video.num_sampling_steps < 1:
+            raise ValueError("logging.eval_video.num_sampling_steps must be positive")
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -321,6 +388,10 @@ class ProjectConfig:
         # must still agree across every rank.
         values["checkpoint"]["resume"] = self.checkpoint.resume is not None
         values["checkpoint"]["warm_start"] = self.checkpoint.warm_start is not None
+        # Val/eval manifests are node-local paths; keep enablement + cadence.
+        values["logging"]["eval_video"]["manifest"] = (
+            self.logging.eval_video.manifest is not None
+        )
         payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

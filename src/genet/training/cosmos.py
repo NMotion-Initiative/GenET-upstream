@@ -140,6 +140,75 @@ def _disable_online_sampling(callbacks: Any) -> None:
             del callbacks[key]
 
 
+def _apply_wandb_logging(resolved: Any, project: ProjectConfig) -> None:
+    wandb = project.logging.wandb
+    resolved.job.project = wandb.project
+    resolved.job.group = wandb.group
+    resolved.job.name = wandb.name or Path(project.checkpoint.output_dir).name or "run"
+    resolved.job.wandb_mode = wandb.mode
+    if wandb.entity:
+        # Cosmos JobConfig has no entity field; W&B reads WANDB_ENTITY.
+        os.environ.setdefault("WANDB_ENTITY", wandb.entity)
+
+
+def _install_eval_video_callback(
+    resolved: Any,
+    project: ProjectConfig,
+    *,
+    embodiment_map: dict[str, int],
+    model_config: Any,
+) -> None:
+    eval_video = project.logging.eval_video
+    if not eval_video.enabled:
+        return
+    from cosmos_framework.utils.lazy_config import LazyCall as L
+
+    from genet.training.eval_video import GenETEvalVideoCallback
+
+    output_root = Path(project.checkpoint.output_dir).expanduser().resolve()
+    fps = float(eval_video.fps if eval_video.fps is not None else project.data.fps)
+    resolved.trainer.callbacks["genet_eval_video"] = L(GenETEvalVideoCallback)(
+        every_n=eval_video.every_n_steps,
+        num_samples=eval_video.num_samples,
+        manifest=eval_video.manifest,
+        output_dir=str(output_root / eval_video.output_subdir),
+        fps=fps,
+        log_to_wandb=eval_video.log_to_wandb,
+        run_at_start=eval_video.run_at_start,
+        num_sampling_steps=eval_video.num_sampling_steps,
+        embodiment_map=embodiment_map,
+        dataset_kwargs={
+            "fps": project.data.fps,
+            "reference_mode": project.data.reference_mode,
+            "reference_seed": project.data.reference_seed,
+            "require_bidirectional_pairs": project.data.require_bidirectional_pairs,
+            "expected_embodiments": project.data.expected_embodiments,
+            "action_alignment": "frame",
+            "tokenizer_config": model_config.vlm_config.tokenizer,
+            "max_caption_tokens": 2048,
+            "use_system_prompt": model_config.vlm_config.use_system_prompt,
+            "shard_seed": project.train.seed,
+            "max_action_dim": project.data.action_dim,
+        },
+        packing_kwargs={
+            "audio_sample_rate": 48_000,
+            "dataset_name": "genet_pairs",
+            "max_samples_per_batch": 1,
+            "max_sequence_length": None,
+            "patch_spatial": model_config.diffusion_expert_config.patch_spatial,
+            "sound_latent_fps": 0,
+            "tokenizer_spatial_compression_factor": (
+                model_config.tokenizer.spatial_compression_factor
+            ),
+            "tokenizer_temporal_compression_factor": (
+                model_config.tokenizer.temporal_compression_factor
+            ),
+        },
+        loader_kwargs={"num_workers": 0},
+        barrier_after_run=True,
+    )
+
+
 def _probe_cosmos_data_contract(
     project: ProjectConfig,
     *,
@@ -411,6 +480,12 @@ def _build_cosmos_config(
     if "grad_clip" in resolved.trainer.callbacks:
         resolved.trainer.callbacks.grad_clip.clip_norm = project.train.grad_clip
     _disable_online_sampling(resolved.trainer.callbacks)
+    _install_eval_video_callback(
+        resolved,
+        project,
+        embodiment_map=embodiment_map,
+        model_config=model_config,
+    )
 
     checkpoint_path, exact_resume = checkpoint_load or _checkpoint_load_path(project)
     if is_hf_snapshot(Path(checkpoint_path)):
@@ -433,10 +508,7 @@ def _build_cosmos_config(
 
     output_root = Path(project.checkpoint.output_dir).expanduser().resolve()
     os.environ["IMAGINAIRE_OUTPUT_ROOT"] = str(output_root)
-    resolved.job.project = "genet"
-    resolved.job.group = "cross_embodiment"
-    resolved.job.name = "run"
-    resolved.job.wandb_mode = "disabled"
+    _apply_wandb_logging(resolved, project)
     resolved.upload_reproducible_setup = False
     return resolved
 

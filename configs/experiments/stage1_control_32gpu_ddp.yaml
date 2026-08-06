@@ -31,3 +31,23 @@ train:
 
 checkpoint:
   output_dir: outputs/stage1_control_32gpu_ddp
+
+# Offline W&B keeps loss curves on-node without port-forward. Switch mode to
+# online and export WANDB_API_KEY (+ HTTPS_PROXY / WANDB_BASE_URL) for cloud sync.
+# Eval videos prefer the processed val split; fall back to the train micro-batch
+# when the val manifest path is unavailable on a node.
+logging:
+  wandb:
+    mode: offline
+    project: genet
+    group: stage1_control_ddp
+    name: s1-ddp
+  eval_video:
+    enabled: true
+    every_n_steps: 1000
+    num_samples: 2
+    manifest: /mnt/nvme/mds-cache/robotwin_v1/genet/processed/val/manifest.jsonl
+    output_subdir: eval_videos
+    log_to_wandb: true
+    run_at_start: false
+    num_sampling_steps: 35
