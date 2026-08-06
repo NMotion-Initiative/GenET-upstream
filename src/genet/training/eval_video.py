@@ -247,6 +247,18 @@ class GenETEvalVideoCallback(_EveryN):  # type: ignore[misc]
         for index, batch in enumerate(batches):
             # Replicate the same batch on every rank to keep sampler collectives happy.
             local_batch = _move_batch_to_device(batch, device)
+            video_value = local_batch.get("video")
+            video_items = (
+                video_value if isinstance(video_value, list) else [video_value]
+            )
+            if video_items and all(
+                isinstance(item, torch.Tensor) and torch.is_floating_point(item)
+                for item in video_items
+            ):
+                # The packing loader already normalized pixels to [-1, 1];
+                # mark the batch so the sampler's normalization pass takes its
+                # preprocessed branch instead of demanding raw uint8 frames.
+                local_batch.setdefault("is_preprocessed", True)
             with torch.no_grad():
                 # Cosmos requires one seed per sample; the eval loader is built
                 # with batch_size=1, so each batch carries exactly one sample.
