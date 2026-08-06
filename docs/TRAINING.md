@@ -529,7 +529,10 @@ checkpoint 的 node publish ID 保持一致。c10d elastic rendezvous 会按 joi
 `genet-validate-data --cosmos --require-bidirectional` 的全量 shape/reciprocity 校验；随后每个 rank 再读取、转换
 自己的首个 global-rank shard 样本。这个 dry-run 不替代预处理阶段带五个 `--expected-embodiment` 的 canonical
 inventory 验证，也不替代 content-lock hash verification。
-它不会构造昂贵模型或进入 optimizer step。通过后再去掉该参数。
+它不会构造昂贵模型或进入 optimizer step。严格集群作业在全量语义校验成功后，会在 writable run root
+写入绑定 `GENET_LAUNCH_ID`、cluster receipt、manifest/config 与已安装源码 identity 的 attestation；
+紧随其后的 train phase 只有在所有节点精确命中时才跳过重复 NPZ 扫描。marker 缺失、损坏或任一 identity
+变化都会 fail closed 回到全量校验。release-verify 的 byte-level rehash 仍是独立完整性门禁，不受此缓存影响。
 
 ## 9. RoCE/NCCL 环境与诊断
 
@@ -700,6 +703,21 @@ PyTorch DCP 通常为每个 rank 生成一个或多个 `.distcp` 文件，并由
 
 production builder 已显式设置 `checkpoint.broadcast_via_filesystem=false`、关闭 async DCP，并关闭上游 object-store save/load，避免错误假设节点间存在共享目录。跨节点持久化完全由下面的 node publish → consolidate → prestage 流程负责。
 
+Hyperbolic 的标准入口在训练成功后默认自动执行同一事务：
+
+```bash
+bash scripts/commit_cluster_dcp_ssh.sh \
+  /secure/path/genet-hosts.txt \
+  "$(source /secure/path/image-ref.txt; echo "${GENET_IMAGE_REF}")" \
+  /mnt/nvme/genet/outputs/<run-id> \
+  /mnt/nvme/genet/committed
+```
+
+脚本从 rank0 的 `latest_checkpoint.txt` 发现 final iteration，在 immutable image 内为每节点生成 source
+manifest，经 SSH/rsync 汇总 `node_00..03`，最后调用 consolidate + verify。worker 不需要代码 checkout。
+`entry_s1_train.sh` 默认 `COMMIT_FINAL_DCP=1`；只做 gate 的模式不会归档，确需禁用时显式设置
+`COMMIT_FINAL_DCP=0`。归档失败会让入口返回非零，但不会删除任何源 shard。
+
 ### 12.2 发布每个节点的 shard
 
 上游 Cosmos 完成一次 DCP save 并经过全局 barrier 后，每个节点只运行一次 node-leader 发布命令：
@@ -830,7 +848,12 @@ shared → dual 时，route-B 必须由 route-A 复制初始化，不能随机�
 
 评估不能只看 FVD。建议固定 validation reference，并对每个 pair 再评估多个 reference 以测量敏感度：
 
-当前 production builder 将 `dataloader_val=None`、`run_validation=false`、W&B 设为 disabled，并移除在线采样 callback，以免 32 卡训练被解码和可视化阻塞。模型的 `generate_samples_from_batch()` 已支持三路条件；下表中的生成式评估仍应由独立、固定版本的离线评估作业执行，并显式固定 sample/reference IDs、seed、solver 和 checkpoint。
+当前 production builder 将 `dataloader_val=None`、`run_validation=false`，并移除不保留三路条件的 upstream
+在线采样 callback。Stage1 集群配置启用 online W&B，并以独立 GenET callback 每 1000 step 读取固定 val
+manifest 生成少量视频。该 H100 allocation 的 `mmaact` 为 `-`，upstream OFU 无有效样本；同时
+`dataloader_speed` 无实现、`training_stats` 的 domain map 与 GenET 不一致，因此三者被显式移除。
+可靠的 IterSpeed、DeviceMonitor、loss、gradient、packing 与 W&B 指标继续保留。模型的
+`generate_samples_from_batch()` 已支持三路条件；下表中的完整生成式评估仍应由独立、固定版本的离线评估作业执行，并显式固定 sample/reference IDs、seed、solver 和 checkpoint。
 
 | 类别 | 指标示例 |
 | --- | --- |

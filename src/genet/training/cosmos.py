@@ -130,14 +130,35 @@ def _validate_hf_cache_revision(cache_root: str | Path, expected_revision: str) 
         )
 
 
-def _disable_online_sampling(callbacks: Any) -> None:
-    """Remove callbacks that call inference without source/reference inputs."""
+def _remove_unsupported_callbacks(callbacks: Any) -> None:
+    """Remove upstream callbacks that are invalid for the GenET deployment."""
 
     if callbacks is None:
         return
-    for key in ("every_n_sample_reg", "every_n_sample_ema"):
-        if key in callbacks:
-            del callbacks[key]
+
+    def remove_unsupported_callbacks() -> None:
+        # Online sampling drops GenET's Source/Reference conditions. The pinned
+        # Edge recipe also carries two target-less telemetry stubs, while OFU
+        # cannot collect numeric mmaact values on this H100 allocation.
+        for key in (
+            "every_n_sample_reg",
+            "every_n_sample_ema",
+            "dataloader_speed",
+            "training_stats",
+            "ofu",
+        ):
+            if key in callbacks:
+                del callbacks[key]
+
+    # Hydra's callback mapping is struct-locked, including against deletion.
+    # Keep plain mapping support for lightweight tests.
+    from omegaconf import OmegaConf, open_dict
+
+    if OmegaConf.is_config(callbacks):
+        with open_dict(callbacks):
+            remove_unsupported_callbacks()
+    else:
+        remove_unsupported_callbacks()
 
 
 def _apply_wandb_logging(resolved: Any, project: ProjectConfig) -> None:
@@ -162,12 +183,13 @@ def _install_eval_video_callback(
     if not eval_video.enabled:
         return
     from cosmos_framework.utils.lazy_config import LazyCall as L
+    from omegaconf import open_dict
 
     from genet.training.eval_video import GenETEvalVideoCallback
 
     output_root = Path(project.checkpoint.output_dir).expanduser().resolve()
     fps = float(eval_video.fps if eval_video.fps is not None else project.data.fps)
-    resolved.trainer.callbacks["genet_eval_video"] = L(GenETEvalVideoCallback)(
+    callback = L(GenETEvalVideoCallback)(
         every_n=eval_video.every_n_steps,
         num_samples=eval_video.num_samples,
         manifest=eval_video.manifest,
@@ -207,6 +229,11 @@ def _install_eval_video_callback(
         loader_kwargs={"num_workers": 0},
         barrier_after_run=True,
     )
+    # Upstream callback mappings are struct-locked after Hydra composition.
+    # Temporarily permit this one GenET-owned extension while preserving the
+    # strict schema for all subsequent mutations.
+    with open_dict(resolved.trainer.callbacks):
+        resolved.trainer.callbacks["genet_eval_video"] = callback
 
 
 def _probe_cosmos_data_contract(
@@ -269,11 +296,68 @@ def _validate_local_cosmos_copy(
     project: ProjectConfig,
     *,
     manifest: Path,
+    manifest_sha256: str,
+    runtime_signature: dict[str, Any],
 ) -> None:
     """Validate every node-local copy in parallel, then share failures globally."""
 
+    from genet.training.validation_cache import (
+        build_validation_attestation,
+        validation_attestation_matches,
+        validation_attestation_path,
+        write_validation_attestation,
+    )
+
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    validation_contract = {
+        "cosmos": True,
+        "num_frames": project.data.num_frames,
+        "height": project.data.height,
+        "width": project.data.width,
+        "action_dim": project.data.action_dim,
+        "require_bidirectional_pairs": project.data.require_bidirectional_pairs,
+        "expected_embodiments": project.data.expected_embodiments,
+        "local_world_size": local_world_size,
+    }
+    expected_attestation = build_validation_attestation(
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
+        distributed_config_fingerprint=project.distributed_fingerprint(),
+        validation_contract=validation_contract,
+        runtime_signature=runtime_signature,
+    )
+    attestation_path = (
+        validation_attestation_path(expected_attestation)
+        if expected_attestation is not None
+        else None
+    )
+    local_cache_hit = bool(
+        expected_attestation is not None
+        and attestation_path is not None
+        and validation_attestation_matches(attestation_path, expected_attestation)
+    )
+    if dist.is_initialized():
+        cache_hits: list[bool | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(cache_hits, local_cache_hit)
+        all_cache_hits = all(item is True for item in cache_hits)
+    else:
+        all_cache_hits = local_cache_hit
+    if all_cache_hits:
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "cosmos_data_validation_cache_hit",
+                        "attestation": str(attestation_path),
+                        "launch_id": os.environ.get("GENET_LAUNCH_ID"),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        return
+
     report: dict[str, Any] | None = None
     try:
         from genet.cli.validate_data import validate_manifest
@@ -319,6 +403,38 @@ def _validate_local_cosmos_copy(
             + json.dumps(failures, ensure_ascii=False, sort_keys=True)
         )
 
+    cache_write_error: str | None = None
+    if (
+        expected_attestation is not None
+        and attestation_path is not None
+        and local_rank == 0
+    ):
+        try:
+            write_validation_attestation(attestation_path, expected_attestation)
+        except Exception as exc:
+            cache_write_error = f"{type(exc).__name__}: {exc}"
+    if dist.is_initialized():
+        cache_write_errors: list[str | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(cache_write_errors, cache_write_error)
+        dist.barrier()
+    else:
+        cache_write_errors = [cache_write_error]
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print(
+            json.dumps(
+                {
+                    "event": "cosmos_data_validation_completed",
+                    "attestation": str(attestation_path) if attestation_path else None,
+                    "cache_write_errors": [
+                        item for item in cache_write_errors if item is not None
+                    ],
+                    "launch_id": os.environ.get("GENET_LAUNCH_ID"),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
 
 def _build_cosmos_config(
     project: ProjectConfig,
@@ -331,6 +447,7 @@ def _build_cosmos_config(
         from cosmos_framework.configs.base.config import make_config
         from cosmos_framework.utils.config_helper import override
         from cosmos_framework.utils.lazy_config import LazyCall as L
+        from omegaconf import open_dict
     except ImportError as exc:  # pragma: no cover - requires NVIDIA container
         raise RuntimeError(
             "Cosmos backend is unavailable. Run scripts/bootstrap_cosmos.sh, install "
@@ -345,10 +462,32 @@ def _build_cosmos_config(
     )
     from genet.models.cosmos_adapter import CosmosCrossEmbodimentModel
 
+    # Upstream vision_sft_edge interpolates ${oc.env:DATASET_PATH} while composing
+    # its default dataloader. GenET replaces that dataloader immediately below, so
+    # only the env lookup must succeed here (the Bridge JSONL path is unused).
+    os.environ.setdefault("DATASET_PATH", str(manifest.parent))
+
     # Resolve the official Edge recipe first, preserving upstream model/checkpoint
     # defaults not owned by this project.
     resolved = override(make_config(), ["--", "experiment=vision_sft_edge"])
     model_config = resolved.model.config
+
+    # The pinned recipe stores this package resource as a checkout-relative
+    # string. Training containers run from /opt/genet, not the Cosmos checkout,
+    # so resolve it against the installed package before model construction.
+    import cosmos_framework
+
+    base_config = model_config.vlm_config.model_instance.config.base_config
+    reasoner_config_path = Path(base_config.json_file)
+    if not reasoner_config_path.is_absolute():
+        package_parent = Path(cosmos_framework.__file__).resolve().parent.parent
+        reasoner_config_path = (package_parent / reasoner_config_path).resolve()
+    if not reasoner_config_path.is_file():
+        raise FileNotFoundError(
+            f"Cosmos reasoner base config does not exist: {reasoner_config_path}"
+        )
+    base_config.json_file = str(reasoner_config_path)
+
     model_config.action_gen = True
     model_config.sound_gen = False
     model_config.max_action_dim = project.data.action_dim
@@ -376,17 +515,21 @@ def _build_cosmos_config(
     model_config.tokenizer.vae_path = str(wan_vae_path)
 
     cross_config = dataclasses.asdict(project.model)
-    resolved.model["_target_"] = CosmosCrossEmbodimentModel
-    resolved.model["_recursive_"] = False
-    resolved.model["cross_embodiment_config"] = cross_config
-    resolved.model["copy_shared_reference_to_dual_on_warm_start"] = (
-        project.checkpoint.copy_shared_reference_to_dual
-        and project.checkpoint.resume is None
-    )
-    resolved.model["initialize_ema_from_regular_on_warm_start"] = (
-        project.checkpoint.resume is None
-    )
-    resolved.model["condition_dropout"] = project.train.condition_dropout
+    # Hydra returns the upstream model node in struct mode. The custom target
+    # deliberately accepts these extra GenET constructor arguments, so add them
+    # within a narrow open_dict scope and restore strictness immediately.
+    with open_dict(resolved.model):
+        resolved.model["_target_"] = CosmosCrossEmbodimentModel
+        resolved.model["_recursive_"] = False
+        resolved.model["cross_embodiment_config"] = cross_config
+        resolved.model["copy_shared_reference_to_dual_on_warm_start"] = (
+            project.checkpoint.copy_shared_reference_to_dual
+            and project.checkpoint.resume is None
+        )
+        resolved.model["initialize_ema_from_regular_on_warm_start"] = (
+            project.checkpoint.resume is None
+        )
+        resolved.model["condition_dropout"] = project.train.condition_dropout
 
     worker_kwargs: dict[str, Any] = {
         "batch_size": project.loader.micro_batch_size,
@@ -479,7 +622,7 @@ def _build_cosmos_config(
     resolved.trainer.run_validation_on_start = False
     if "grad_clip" in resolved.trainer.callbacks:
         resolved.trainer.callbacks.grad_clip.clip_norm = project.train.grad_clip
-    _disable_online_sampling(resolved.trainer.callbacks)
+    _remove_unsupported_callbacks(resolved.trainer.callbacks)
     _install_eval_video_callback(
         resolved,
         project,
@@ -494,7 +637,8 @@ def _build_cosmos_config(
         # CosmosCrossEmbodimentModel.load_pretrained_model_if_needed instead.
         assert not exact_resume
         resolved.checkpoint.load_path = ""
-        resolved.model["hf_warm_start_path"] = checkpoint_path
+        with open_dict(resolved.model):
+            resolved.model["hf_warm_start_path"] = checkpoint_path
     else:
         resolved.checkpoint.load_path = checkpoint_path
     resolved.checkpoint.load_training_state = exact_resume
@@ -511,6 +655,18 @@ def _build_cosmos_config(
     _apply_wandb_logging(resolved, project)
     resolved.upload_reproducible_setup = False
     return resolved
+
+
+def _cosmos_launch_args() -> argparse.Namespace:
+    """Mirror the argument surface consumed by the pinned upstream launcher."""
+
+    return argparse.Namespace(
+        attach_vscode_debugger=False,
+        config="genet:cosmos3_edge",
+        deterministic=False,
+        dryrun=False,
+        opts=[],
+    )
 
 
 def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> None:
@@ -596,7 +752,12 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
             os.environ.get("GENET_HF_ARTIFACT", "hf_cache"),
             hf_cache,
         )
-    _validate_local_cosmos_copy(project, manifest=manifest)
+    _validate_local_cosmos_copy(
+        project,
+        manifest=manifest,
+        manifest_sha256=manifest_hash,
+        runtime_signature=environment_signature,
+    )
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     probe_id: str | None = None
@@ -662,10 +823,4 @@ def run_cosmos_training(project: ProjectConfig, *, dry_run: bool = False) -> Non
             )
         return
 
-    args = argparse.Namespace(
-        attach_vscode_debugger=False,
-        config="genet:cosmos3_edge",
-        deterministic=False,
-        dryrun=False,
-    )
-    launch(config, args)
+    launch(config, _cosmos_launch_args())

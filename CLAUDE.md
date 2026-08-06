@@ -1,4 +1,4 @@
-# GenET @ Hyperbolic 集群 — 会话上下文（2026-08-05 由 Helin 的助手写入）
+# GenET @ Hyperbolic 集群 — 会话上下文（2026-08-06）
 
 **先看实时状态：`/root/GENET_STATUS.md`、`/root/GENET_HEARTBEAT.md`，以及开发日志 `docs/DEVLOG.md`。**
 
@@ -9,6 +9,7 @@ cd /root/GenET
 tmux new -s genet-train   # 或 attach
 bash scripts/entry_s1_train.sh              # 全闸门 → 正式训
 bash scripts/entry_s1_train.sh --dry-run-only
+bash scripts/entry_s1_train.sh --max-steps 20
 ```
 
 详情与 W&B / eval video 说明见 [`docs/DEVLOG.md`](docs/DEVLOG.md)。
@@ -24,13 +25,15 @@ bash scripts/entry_s1_train.sh --dry-run-only
 - **DDP whole-model-per-GPU + HF snapshot warm start**（commit `d66bdf0`）；**不做 DCP 转换**。
 - config：`configs/experiments/stage1_control_32gpu_ddp.yaml`；启动链：`scripts/launch_cluster_ssh.sh`（支持 `--verify-release-only` / `--preflight-only` / `--dry-run-only` 分段旗标）。
 - `s1.env` 的 `BASE_CHECKPOINT_PATH` 已改指 HF snapshot（原值指向空 DCP 目录会崩；备份在 `/secure/path/s1.env.bak-20260805`）。
-- ⚠️ `docs/HYPERBOLIC.md` 的 DCP 章节与启动示例已过时（用的旧 HSDP config），勿照抄。
+- 32-GPU 20-step smoke 已跑通；W&B online、final DCP 保存和退出清理均成功。
+- dry-run 的语义数据校验会产生同一 launch 可复用的 attestation；train 不再重复扫描完整 NPZ。
+- full run 结束后默认将 final DCP 汇总到 rank0 `/mnt/nvme/genet/committed/<run-id>/`。
 
 ## 硬约束（除非 Helin 明确要求，绝不）
-1. **不启动、不终止真实训练**；不 kill 正在跑的 preprocess / 编排器进程。
+1. 启动/终止作业前先检查 `tmux`、launcher 和四节点容器，不要误杀别的作业。
 2. **不重启本机、不重启 docker/containerd**——四节点 docker 存储都在 /dev/shm（tmpfs），重启即丢；registry 容器的重建命令没有留档。
-3. 不动 `/mnt/nvme` 下的数据与 processed 产物；不改已有代码；`main` 上有 7 个未 push 的 commit（等 GitHub push 权限）。
+3. 不动 `/mnt/nvme` 下的原始数据与 processed 产物；checkpoint 只有 `COMMITTED` 验证后才可发布或清理源 shard。
 4. GPU 在按小时烧钱，别跑非必要的大作业；短的验证/预检类命令可以。
 
 ## 已知待办（接手清单）
-开训确认（Helin 本人）→ 用 `scripts/entry_s1_train.sh` 跑通闸门/训练 → push commits（要 ACondaway 授权）→ checkpoint 外传 S3 方案（无自动外传，RAID0 随租约丢）→ registry 重建 runbook 补档 → W&B online 需代理/端口转发（stage1 默认 offline）→ NCCL 保持单轨 `mlx5_2`（勿开 multi-rail）。
+提交当前 lifecycle 修复 → 从干净 commit 构建并固定镜像 → 重建 release lock/receipts → 短 smoke 验证 cache hit 与 DCP 自动 commit → 再决定 50k 正式训练。外部 archive/S3 尚未配置，rank0 NVMe 仍随租约有丢失风险；NCCL 保持单轨 `mlx5_2`。

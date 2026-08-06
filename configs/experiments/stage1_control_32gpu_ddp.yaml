@@ -32,13 +32,13 @@ train:
 checkpoint:
   output_dir: outputs/stage1_control_32gpu_ddp
 
-# Offline W&B keeps loss curves on-node without port-forward. Switch mode to
-# online and export WANDB_API_KEY (+ HTTPS_PROXY / WANDB_BASE_URL) for cloud sync.
+# Online W&B: launch allowlists WANDB_* from the host env (/secure/path/wandb.env).
+# Set HTTPS_PROXY / WANDB_BASE_URL if the cluster cannot reach api.wandb.ai directly.
 # Eval videos prefer the processed val split; fall back to the train micro-batch
 # when the val manifest path is unavailable on a node.
 logging:
   wandb:
-    mode: offline
+    mode: online
     project: genet
     group: stage1_control_ddp
     name: s1-ddp

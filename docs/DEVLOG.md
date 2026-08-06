@@ -16,6 +16,9 @@ bash scripts/entry_s1_train.sh
 # 或只做闸门
 bash scripts/entry_s1_train.sh --dry-run-only
 bash scripts/entry_s1_train.sh --preflight-only
+
+# 真实 forward/backward smoke，结束后自动汇总 final DCP
+bash scripts/entry_s1_train.sh --max-steps 20
 ```
 
 监控：
@@ -36,7 +39,8 @@ nvidia-smi
 | `/secure/path/genet-hosts.txt` | 四节点 rank 序 |
 | `/secure/path/image-ref.txt` | 镜像 digest |
 | `/mnt/nvme/genet/checkpoints/Cosmos3-Edge` | HF 实体权重（非 symlink snapshot） |
-| `configs/experiments/stage1_control_32gpu_ddp.yaml` | DDP stage1 + offline W&B + eval video |
+| `configs/experiments/stage1_control_32gpu_ddp.yaml` | 32-GPU stage1 + online W&B + eval video |
+| `/mnt/nvme/genet/committed/<run-id>/iter_*` | rank0 上已校验、带 `COMMITTED` 的完整 DCP |
 
 ## DONE（截至 2026-08-06）
 
@@ -48,21 +52,25 @@ nvidia-smi
 - 日志目录重名：入口脚本用时间戳 `run-id`
 - **增量**：`logging.wandb` + `logging.eval_video`（本地 MP4，可选 W&B）
 - **增量**：`scripts/entry_s1_train.sh` 训练入口
+- 32-GPU `s1-smoke-20st-20260806-054430` 已完成 20 steps，W&B online 同步成功
+- Cosmos config/launch 兼容问题已修：OmegaConf struct、`DATASET_PATH`、reasoner JSON、`args.opts`
+- dry-run 成功语义校验会写 launch-scoped attestation；同一 launch 的 train 命中后不再重复扫描 304G NPZ
+- full run 成功后入口默认把四节点 final DCP 汇总到 rank0 并执行 checksum/`COMMITTED` 验证
 
 ## ONGOING / 遗留
 
-- 完整 32 卡正式训练尚未跑通验证（闸门多次卡在 release/物料，后已修；需用入口脚本重跑）
-- W&B **online** 需要本机/跳板端口转发或 HTTPS 代理；当前 stage1 默认 `offline`（曲线写在节点本地 wandb 目录）
+- 20-step smoke 已跑通；50k 正式训练尚未启动
+- W&B 默认 online；若后续 allocation 无直连出口，在 `/secure/path/wandb.env` 配 `HTTPS_PROXY` / `WANDB_BASE_URL`
 - multi-rail 仍不可用；保持单轨 `mlx5_2`
 - 缺 `nvidia-peermem` 时 GDR 可能打折（容器会提示）
-- checkpoint 外传 S3 / registry 重建 runbook 仍待补
+- committed DCP 当前只保存在 rank0 NVMe；外部 archive/S3 仍需单独配置
 
 ## W&B / eval video 说明
 
 配置在 YAML `logging:` 下（见 `configs/base.yaml`）。
 
 - `logging.wandb.mode`: `disabled` | `offline` | `online`
-- online 时在 launch 环境导出：`WANDB_API_KEY`，以及 `HTTPS_PROXY` 或 `WANDB_BASE_URL`
+- online 凭证从 `/secure/path/wandb.env` 注入；必要时同时设置 `HTTPS_PROXY` 或 `WANDB_BASE_URL`
 - `logging.eval_video.enabled: true` 时每 `every_n_steps` 在条件推理后写  
   `{output}/eval_videos/step_XXXXXXXX/{sampleN}_pred.mp4`（及 GT）
 - stage1 DDP 默认读 val manifest：  
