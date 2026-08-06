@@ -931,10 +931,17 @@ def _stage_artifacts_once(
             existing_receipt = json.loads(paths.receipt.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing_receipt = {}
-        # A download-only staging deliberately records converted=false; verify
-        # what the receipt claims instead of demanding a DCP that was never
-        # produced (whole-model-per-GPU deployments skip conversion).
-        converted = bool(existing_receipt.get("converted", True))
+        # A download-only staging deliberately records no converted DCP
+        # (cosmos3_edge.dcp_root is null); verify what the receipt claims
+        # instead of demanding a DCP that was never produced
+        # (whole-model-per-GPU deployments skip conversion).
+        cosmos_receipt = existing_receipt.get("cosmos3_edge")
+        recorded_dcp = (
+            cosmos_receipt.get("dcp_root")
+            if isinstance(cosmos_receipt, Mapping)
+            else None
+        )
+        converted = bool(existing_receipt.get("converted", recorded_dcp is not None))
     if converted:
         _convert_dcp(
             spec,
