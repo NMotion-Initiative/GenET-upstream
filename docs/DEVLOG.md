@@ -68,6 +68,12 @@ nvidia-smi
 - stage1 DDP 默认读 val manifest：  
   `/mnt/nvme/mds-cache/robotwin_v1/genet/processed/val/manifest.jsonl`
 
+## GitHub 备份
+
+- Mirror: https://github.com/NMotion-Initiative/genet （private，`main` = 当前 h32 HEAD）
+- 本地 remote：`nm-backup`
+- 推送：`git push nm-backup main`
+
 ## 相关材料
 
 - 接手上下文：`CLAUDE.md`
