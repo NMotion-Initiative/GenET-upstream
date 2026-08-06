@@ -12,10 +12,6 @@ data:
     - piper
     - ur5-wsg
   require_bidirectional_pairs: true
-  # Peak reserved memory measured at micro_batch_size=1 was ~24 GiB/80 GiB
-  # (s1-smoke-5000st-20260806-071831, iter 1000); activations are the only
-  # batch-scaled term under full activation checkpointing.
-  micro_batch_size: 4
 
 model:
   backend: cosmos3_edge
