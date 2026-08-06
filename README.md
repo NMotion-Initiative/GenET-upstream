@@ -144,13 +144,20 @@ image. After copying and filling the environment/host templates and creating the
 nodes from rank 0 with one attached command:
 
 ```bash
+# Standard entry: wraps release-lock creation, worker data checks, lock
+# distribution, and the full launcher sequence under a timestamped run-id.
+bash scripts/entry_s1_train.sh                    # all gates -> full training
+bash scripts/entry_s1_train.sh --dry-run-only     # stop after the 32-rank dry run
+bash scripts/entry_s1_train.sh --max-steps 5000   # gates + dry run + 5000-step run
+
+# Equivalent explicit launcher invocation:
 export GENET_IMAGE_REF='registry.example/genet@sha256:<image-digest>'
 
 bash scripts/launch_cluster_ssh.sh \
   --hosts /secure/path/genet-hosts.txt \
   --env /secure/path/s1.env \
   --image "${GENET_IMAGE_REF}" \
-  --config configs/experiments/stage1_control_32gpu.yaml \
+  --config configs/experiments/stage1_control_32gpu_ddp.yaml \
   --run-id s1-control-seed42 \
   --log-dir /mnt/nvme/genet/logs/s1-control-seed42 \
   -- \
@@ -179,24 +186,33 @@ The exact reviewed artifacts come from the official
 [`Wan-AI/Wan2.2-TI2V-5B`](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B) repositories and are pinned in
 `configs/checkpoints/cosmos3_edge.json`. Inside the immutable image on
 the staging node, one command downloads the complete Cosmos3-Edge snapshot and Wan VAE, verifies every indexed model
-shard plus the VAE byte count/SHA-256, converts the snapshot to DCP, writes a recursive DCP SHA-256 manifest, updates the
-offline HF ref, and publishes an artifact receipt under one run-root lock:
+shard plus the VAE byte count/SHA-256, updates the offline HF ref, and publishes an artifact receipt under one run-root
+lock. The S1 DDP deployment loads whole-model replicas straight from the safetensors snapshot, so stage with
+`--download-only` (the receipt records `dcp_root: null`); no DCP conversion happens or is verified later:
 
 ```bash
-bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet
+bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet --download-only
 
 # Later, with networking disabled:
 bash scripts/stage_model_artifacts.sh --run-root /mnt/nvme/genet --verify-only
 ```
 
-The resulting paths are `/mnt/nvme/genet/hf-cache`,
-`/mnt/nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth`, and
-`/mnt/nvme/genet/checkpoints/Cosmos3-Edge`. No separate Wan DiT, DROID policy, Reasoner checkpoint, ControlNet, or
+The resulting paths are `/mnt/nvme/genet/hf-cache` and
+`/mnt/nvme/genet/artifacts/wan22_vae/Wan2.2_VAE.pth`. Because release locks hash artifacts by content and reject
+symlinks that resolve outside the artifact root, the HF snapshot itself cannot be a lock artifact; materialize a
+dereferenced copy on every node and lock/warm-start from that path instead:
+
+```bash
+SNAP=/mnt/nvme/genet/hf-cache/hub/models--nvidia--Cosmos3-Edge/snapshots/<revision>
+cp -rL "${SNAP}" /mnt/nvme/genet/checkpoints/Cosmos3-Edge
+```
+
+No separate Wan DiT, DROID policy, Reasoner checkpoint, ControlNet, or
 reference encoder checkpoint is required for S1; the new GenET branches initialize during training.
 `HF_HOME` must be exactly `/mnt/nvme/genet/hf-cache`; use only an ephemeral `HF_TOKEN` environment variable if access
 policy requires authentication, because the script rejects persisted token files in the replicated cache.
-Budget at least 100 GB free for the current 29.5 GB Cosmos snapshot, 2.82 GB Wan VAE, converted DCP, temporary files,
-and any explicitly preserved `--force` backup.
+Budget at least 100 GB free for the current 29.5 GB Cosmos snapshot, 2.82 GB Wan VAE, the dereferenced checkpoint copy,
+temporary files, and any explicitly preserved `--force` backup.
 
 For interactive bring-up inside the NVIDIA Cosmos training container:
 
@@ -211,6 +227,18 @@ Production nodes should not resolve and install dependencies independently. Buil
 uses Apptainer, convert the image once, distribute the same SIF, and use its SHA-256 as the image identity.
 
 ```bash
+# Wrapper: stages the git-archive context under GENET_BUILD_CONTEXT_ROOT
+# (default /dev/shm), refuses a dirty tracked worktree, embeds the revision
+# file, and builds with BuildKit. cu128-train matches the pytorch:25.06-py3
+# base used on the Hyperbolic cluster; cu130-train is the default elsewhere.
+BASE_IMAGE='nvcr.io/nvidia/pytorch@sha256:<base-image-digest>' \
+GENET_IMAGE_TAG="registry.example/genet:$(git rev-parse HEAD)" \
+COSMOS_DEPENDENCY_GROUP=cu128-train \
+bash scripts/build_hyperbolic_image.sh
+
+docker push "registry.example/genet:$(git rev-parse HEAD)"
+
+# Equivalent manual pipeline:
 GENET_REVISION="$(git rev-parse HEAD)"
 
 git archive --format=tar \
@@ -218,7 +246,7 @@ git archive --format=tar \
   HEAD | docker build -f containers/Dockerfile \
   --build-arg BASE_IMAGE='registry.example/cosmos-train@sha256:<base-image-digest>' \
   --build-arg GENET_CODE_REVISION="${GENET_REVISION}" \
-  --build-arg COSMOS_DEPENDENCY_GROUP=cu130-train \
+  --build-arg COSMOS_DEPENDENCY_GROUP=cu128-train \
   -t registry.example/genet:${GENET_REVISION} -
 
 docker push registry.example/genet:${GENET_REVISION}
@@ -272,9 +300,9 @@ genet-cluster-lock create \
 ```
 
 If this release has no approved normalization artifact yet, omit that logical entry from both the create and verify
-commands. `training_checkpoint` must point to the exact DCP passed through `--warm-start`, `--resume`, or
-`BASE_CHECKPOINT_PATH` for this job: use the Cosmos3-Edge base DCP for S1, the selected prior-stage DCP for S2/S3, and the
-prestaged committed DCP for resume. Hashing the full processed dataset is intentionally a staging/deployment operation
+commands. `training_checkpoint` must point to the exact checkpoint passed through `--warm-start`, `--resume`, or
+`BASE_CHECKPOINT_PATH` for this job: use the dereferenced Cosmos3-Edge snapshot copy for S1 (whole-model DDP, no DCP
+conversion), the selected prior-stage committed DCP for S2/S3, and the prestaged committed DCP for resume. Hashing the full processed dataset is intentionally a staging/deployment operation
 rather than a per-step training operation.
 
 ### 2. Copy and verify every local replica
