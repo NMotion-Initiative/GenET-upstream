@@ -248,9 +248,12 @@ class GenETEvalVideoCallback(_EveryN):  # type: ignore[misc]
             # Replicate the same batch on every rank to keep sampler collectives happy.
             local_batch = _move_batch_to_device(batch, device)
             with torch.no_grad():
+                # Cosmos requires one seed per sample; the eval loader is built
+                # with batch_size=1, so each batch carries exactly one sample.
                 sample = model.generate_samples_from_batch(
                     local_batch,
                     num_steps=self.num_sampling_steps,
+                    seed=[int(iteration) + index],
                 )
                 vision = _extract_vision_sample(sample)
                 if isinstance(vision, (list, tuple)):
