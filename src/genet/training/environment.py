@@ -344,6 +344,11 @@ def _git_head(start: Path) -> str | None:
     for parent in (start, *start.parents):
         git_entry = parent / ".git"
         if not git_entry.exists():
+            if parent.name in ("site-packages", "dist-packages"):
+                # A package installed into an environment is not part of any
+                # enclosing checkout; never attribute a parent repository's
+                # HEAD to it.
+                return None
             continue
         git_dir = git_entry
         if git_entry.is_file():
